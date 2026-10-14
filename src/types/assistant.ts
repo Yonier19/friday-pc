@@ -43,6 +43,10 @@ export interface WindowsNotification {
   read?: boolean;
 }
 
+export type ResponseTier = 'web' | 'gemini' | 'gemini_lite' | 'local' | 'emergency' | 'cache';
+export type ConfidenceLevel = 'alta' | 'media' | 'baja';
+export type ResponseLength = 'breve' | 'normal' | 'detallada';
+
 export interface ChatMessage {
   id: string;
   sender: 'user' | 'viernes';
@@ -59,7 +63,13 @@ export interface ChatMessage {
     content?: string;
   };
   sources?: GroundingSource[];
-  source?: 'gemini' | 'gemini_search' | 'local_subsystem';
+  source?: 'gemini' | 'gemini_search' | 'local_subsystem' | 'gemini_lite' | 'emergency';
+  tier?: ResponseTier;
+  confidence?: ConfidenceLevel;
+  disclaimer?: string;
+  clarificationQuestion?: string;
+  isCorrection?: boolean;
+  isStreaming?: boolean;
 }
 
 export type OrbThemeColor = 'cyan' | 'amethyst' | 'gold' | 'emerald';
@@ -67,6 +77,11 @@ export type OrbThemeColor = 'cyan' | 'amethyst' | 'gold' | 'emerald';
 export interface AISettings {
   provider: 'gemini' | 'local' | 'custom';
   model: string;
+  fallbackModel?: string;
+  autoWebSearch?: boolean;
+  responseLength?: ResponseLength;
+  userCity?: string;
+  userTimezone?: string;
   customApiKey: string;
   customEndpoint: string;
   wakeWord: string;
@@ -90,6 +105,7 @@ export interface AISettings {
   notificationAllowedApps?: string[];
   notificationBlockedApps?: string[];
   privacyNoticeAccepted?: boolean;
+  proxyUrl?: string;
 }
 
 export interface SystemTelemetry {

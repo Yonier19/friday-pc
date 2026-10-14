@@ -5,16 +5,14 @@ import {
   Send, 
   Sparkles, 
   Trash2, 
-  Flame, 
-  ExternalLink,
-  HelpCircle,
+  Globe,
   Clock,
-  Compass
+  Cpu,
+  Brain
 } from 'lucide-react';
-import { ChatMessage, ListeningState, OrbThemeColor, AISettings } from '../types/assistant';
+import { ChatMessage, ListeningState, AISettings } from '../types/assistant';
 import { ViernesOrb } from './ViernesOrb';
 import { ChatMessageItem } from './ChatMessageItem';
-import { audioService } from '../services/audioService';
 
 interface MainScreenProps {
   messages: ChatMessage[];
@@ -25,6 +23,9 @@ interface MainScreenProps {
   settings: AISettings;
   onExecuteAction: (action: any) => void;
   transcriptInterim: string;
+  thinkingStatus?: string;
+  onFollowUpClick?: (prompt: string) => void;
+  onSaveToMemory?: (content: string) => void;
 }
 
 export const MainScreen: React.FC<MainScreenProps> = ({
@@ -36,6 +37,9 @@ export const MainScreen: React.FC<MainScreenProps> = ({
   settings,
   onExecuteAction,
   transcriptInterim,
+  thinkingStatus,
+  onFollowUpClick,
+  onSaveToMemory,
 }) => {
   const [inputText, setInputText] = useState('');
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
@@ -45,7 +49,7 @@ export const MainScreen: React.FC<MainScreenProps> = ({
     if (chatScrollRef.current) {
       chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
-  }, [messages, transcriptInterim]);
+  }, [messages, listeningState, thinkingStatus]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -55,16 +59,12 @@ export const MainScreen: React.FC<MainScreenProps> = ({
   };
 
   const sampleSuggestions = [
-    'Oye Viernes, ¿cuál es el clima de hoy?',
-    '¿Cuáles son las noticias más recientes del mundo?',
-    'Léeme las notificaciones pendientes',
-    'Abre YouTube y busca música lofi',
+    '¿Qué noticias hay de tecnología hoy?',
+    '¿Cómo está el clima en Madrid ahora?',
+    'Calcula el 15% de 800 más 45',
     'Pon un temporizador de 5 minutos',
-    'Recuerda que mi comida favorita es sushi',
-    'Abre Spotify',
-    '¿Cuál es el valor del dólar y bitcoin hoy?',
-    'Calcula 350 * 1.21',
-    '¿Quién eres y qué puedes hacer?',
+    '¿Qué sabes de mis preferencias?',
+    'Escribe una función en TypeScript para invertir texto',
   ];
 
   return (
@@ -83,6 +83,20 @@ export const MainScreen: React.FC<MainScreenProps> = ({
           <div className="mt-2 px-4 py-1.5 rounded-full bg-red-950/70 border border-red-500/50 text-red-200 text-xs font-rajdhani flex items-center space-x-2 animate-pulse">
             <span className="w-2 h-2 rounded-full bg-red-400 animate-ping" />
             <span>Escuchando: &quot;{transcriptInterim}&quot;</span>
+          </div>
+        )}
+
+        {/* Live Thinking / Searching Web status indicator (Requirement 5) */}
+        {listeningState === 'THINKING' && (
+          <div className="mt-2 px-4 py-1.5 rounded-full bg-cyan-950/80 border border-cyan-400/50 text-cyan-200 text-xs font-orbitron flex items-center space-x-2 animate-pulse shadow-md shadow-cyan-950">
+            {thinkingStatus && thinkingStatus.toLowerCase().includes('web') ? (
+              <Globe className="w-3.5 h-3.5 text-cyan-400 animate-spin" />
+            ) : thinkingStatus && thinkingStatus.toLowerCase().includes('local') ? (
+              <Cpu className="w-3.5 h-3.5 text-cyan-400" />
+            ) : (
+              <Brain className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
+            )}
+            <span>{thinkingStatus || 'Pensando respuesta táctica...'}</span>
           </div>
         )}
 
@@ -135,37 +149,39 @@ export const MainScreen: React.FC<MainScreenProps> = ({
                 message={msg}
                 theme={settings.orbTheme}
                 onExecuteAction={onExecuteAction}
+                onFollowUpClick={onFollowUpClick}
+                onSaveToMemory={onSaveToMemory}
               />
             ))}
           </div>
         )}
       </div>
 
-      {/* Bottom Command Prompt Input Bar */}
-      <div className="p-3 sm:p-4 bg-slate-950/90 border-t border-cyan-900/40 backdrop-blur-md shrink-0">
+      {/* Bottom Command Bar */}
+      <div className="p-3 sm:p-4 border-t border-slate-800/80 bg-slate-950/80 backdrop-blur-md shrink-0">
         <form onSubmit={handleSubmit} className="max-w-4xl mx-auto flex items-center space-x-2">
-          {/* Mic Toggle Button */}
+          {/* Mic Button */}
           <button
             type="button"
             onClick={onToggleListening}
-            className={`p-3 rounded-xl border transition-all flex items-center justify-center shrink-0 ${
+            className={`p-2.5 rounded-xl border transition-all ${
               listeningState === 'LISTENING'
-                ? 'bg-red-600 text-white border-red-400 shadow-lg shadow-red-500/40 animate-pulse'
-                : 'bg-slate-900 hover:bg-cyan-950 text-cyan-300 border-cyan-700/50 hover:border-cyan-400 shadow-md'
+                ? 'bg-red-600 border-red-400 text-white shadow-lg shadow-red-950 animate-pulse'
+                : 'bg-slate-900 border-slate-700 text-slate-300 hover:text-cyan-300 hover:border-cyan-500/50'
             }`}
-            title={listeningState === 'LISTENING' ? 'Detener micrófono' : 'Hablar con Viernes'}
+            title={listeningState === 'LISTENING' ? 'Detener escucha' : 'Activar reconocimiento vocal'}
           >
             {listeningState === 'LISTENING' ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
           </button>
 
           {/* Text Input */}
-          <div className="flex-1 relative">
+          <div className="relative flex-1">
             <input
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              placeholder='Instruye a Viernes... ej: "Oye Viernes, recuérdame..." o "Abre Spotify"'
-              className="w-full px-4 py-3 rounded-xl bg-slate-900/90 border border-slate-700 focus:border-cyan-400 text-white placeholder-slate-500 text-sm font-rajdhani font-medium tracking-wide focus:outline-none focus:ring-1 focus:ring-cyan-500/50 transition-all"
+              placeholder='Escribe tu comando o consulta ("¿Qué tiempo hace?", "Calcula...", "Pon alarma")...'
+              className="w-full px-4 py-2.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-cyan-400 text-slate-100 placeholder-slate-500 text-sm font-rajdhani focus:outline-none focus:ring-1 focus:ring-cyan-500/50 shadow-inner"
             />
           </div>
 
@@ -173,7 +189,7 @@ export const MainScreen: React.FC<MainScreenProps> = ({
           <button
             type="submit"
             disabled={!inputText.trim()}
-            className="p-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 disabled:hover:bg-cyan-600 text-white font-rajdhani font-semibold border border-cyan-400/40 transition-all flex items-center justify-center shadow-lg shadow-cyan-900/30"
+            className="p-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 disabled:hover:bg-cyan-600 text-white font-semibold transition-all shadow-md shadow-cyan-950"
             title="Enviar comando"
           >
             <Send className="w-5 h-5" />

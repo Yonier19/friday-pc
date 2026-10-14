@@ -307,9 +307,55 @@ ipcMain.handle('decrypt-string', (event, encryptedBase64) => {
   return Buffer.from(encryptedBase64, 'base64').toString('utf-8');
 });
 
+// Network Proxy Handlers
+ipcMain.handle('get-system-proxy', async (event, testUrl = 'https://generativelanguage.googleapis.com') => {
+  try {
+    const resolved = await session.defaultSession.resolveProxy(testUrl);
+    return resolved || 'DIRECT';
+  } catch (err) {
+    return 'DIRECT';
+  }
+});
+
+ipcMain.handle('set-network-proxy', async (event, proxyUrl) => {
+  try {
+    if (proxyUrl && proxyUrl.trim()) {
+      const cleanProxy = proxyUrl.trim();
+      await session.defaultSession.setProxy({ proxyRules: cleanProxy });
+      process.env.HTTPS_PROXY = cleanProxy;
+      process.env.HTTP_PROXY = cleanProxy;
+      console.log(`[Electron] Proxy de red configurado: ${cleanProxy}`);
+    } else {
+      await session.defaultSession.setProxy({ mode: 'system' });
+      delete process.env.HTTPS_PROXY;
+      delete process.env.HTTP_PROXY;
+      console.log('[Electron] Proxy de red restablecido a modo del sistema (Direct/System).');
+    }
+    return { success: true };
+  } catch (err) {
+    console.warn('[Electron] Error configurando proxy:', err.message);
+    return { success: false, error: err.message };
+  }
+});
+
 // App lifecycle
 app.whenReady().then(async () => {
   try {
+    // Check if proxy was previously saved in credentials
+    const credsPath = path.join(userDataDir, 'viernes_credentials.json');
+    if (require('fs').existsSync(credsPath)) {
+      try {
+        const creds = JSON.parse(require('fs').readFileSync(credsPath, 'utf-8'));
+        if (creds.proxy && creds.proxy.trim()) {
+          const proxy = creds.proxy.trim();
+          await session.defaultSession.setProxy({ proxyRules: proxy });
+          process.env.HTTPS_PROXY = proxy;
+          process.env.HTTP_PROXY = proxy;
+          console.log(`[Electron] Proxy inicial cargado desde UserData: ${proxy}`);
+        }
+      } catch {}
+    }
+
     await bootServer();
     createWindow();
     createTray();

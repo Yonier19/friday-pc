@@ -6,10 +6,18 @@ import fs from 'fs';
 import os from 'os';
 import http from 'http';
 import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
+import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
+import { IntentRouter, IntentClassification } from './src/services/intentRouter';
 
 dotenv.config();
+
+// Configuración de Proxy del Sistema y Variables de Entorno para fetch global
+try {
+  setGlobalDispatcher(new EnvHttpProxyAgent());
+} catch (e) {
+  console.warn('[Viernes System] Aviso configurando EnvHttpProxyAgent:', e);
+}
 
 const currentDir = typeof __dirname !== 'undefined'
   ? __dirname
@@ -18,7 +26,7 @@ const currentDir = typeof __dirname !== 'undefined'
 const app = express();
 app.use(express.json({ limit: '25mb' }));
 
-// User Data Directory
+// Directorio de almacenamiento de usuario persistente
 const userDataDir = process.env.VIERNES_USER_DATA || path.join(os.homedir(), '.viernes_assistant');
 if (!fs.existsSync(userDataDir)) {
   try {
@@ -30,21 +38,141 @@ if (!fs.existsSync(userDataDir)) {
 
 const credentialsFile = path.join(userDataDir, 'viernes_credentials.json');
 const userStoreFile = path.join(userDataDir, 'viernes_store.json');
+const connectionLogFile = path.join(userDataDir, 'connection.log');
 
-// Initialize Gemini Client
-let currentApiKey = process.env.GEMINI_API_KEY || '';
+// ==========================================
+// REGISTRO DE CONECTIVIDAD SEGURO (SIN EXPONER KEYS)
+// ==========================================
+export function logConnectionEvent(tier: string, status: string | number, latencyMs: number, detail: string) {
+  try {
+    const timestamp = new Date().toISOString();
+    // Sanitizar rigurosamente para jamás registrar claves ni tokens
+    const sanitizedDetail = (detail || '')
+      .replace(/AIza[0-9A-Za-z-_]{30,}/g, '[CLAVE_REDACTADA]')
+      .replace(/key=[^&\s]+/g, 'key=[REDACTADO]')
+      .replace(/"apiKey"\s*:\s*"[^"]+"/g, '"apiKey":"[REDACTADO]"')
+      .replace(/\n+/g, ' ')
+      .trim();
 
-if ((!currentApiKey || currentApiKey === 'MY_GEMINI_API_KEY') && fs.existsSync(credentialsFile)) {
+    const entry = `[${timestamp}] [TIER: ${tier}] [STATUS: ${status}] [LATENCY: ${latencyMs}ms] ${sanitizedDetail}\n`;
+    fs.appendFileSync(connectionLogFile, entry, 'utf-8');
+
+    // Mantener tamaño de connection.log por debajo de 500KB
+    if (fs.existsSync(connectionLogFile)) {
+      const stats = fs.statSync(connectionLogFile);
+      if (stats.size > 512 * 1024) {
+        const content = fs.readFileSync(connectionLogFile, 'utf-8');
+        const lines = content.split('\n');
+        fs.writeFileSync(connectionLogFile, lines.slice(-250).join('\n'), 'utf-8');
+      }
+    }
+  } catch (e) {
+    console.warn('[Viernes System] Error al registrar evento en connection.log:', e);
+  }
+}
+
+// ==========================================
+// TRADUCTOR Y GUÍA DE CÓDIGOS DE ERROR
+// ==========================================
+export function explainErrorCode(code: string | number | undefined, rawMsg?: string): { explanation: string; suggestedFix: string } {
+  const codeStr = String(code || '').toUpperCase();
+  const lower = (rawMsg || '').toLowerCase();
+
+  if (codeStr === '401' || lower.includes('unauthenticated') || lower.includes('api_key_invalid') || lower.includes('api key not valid')) {
+    return {
+      explanation: 'Clave de API inválida, expirada o revocada por Google (Código 401).',
+      suggestedFix: 'Genera una nueva clave gratuita en Google AI Studio (aistudio.google.com) y guárdala en Ajustes.',
+    };
+  }
+  if (codeStr === '403' || lower.includes('permission_denied') || lower.includes('location not supported') || lower.includes('consumer_invalid')) {
+    return {
+      explanation: 'Acceso prohibido o región geográfica restringida para esta clave (Código 403).',
+      suggestedFix: 'Verifica que la API Generative Language esté habilitada en tu proyecto de Google Cloud o que tu conexión no esté bloqueada regionalmente.',
+    };
+  }
+  if (codeStr === '404' || lower.includes('not_found') || lower.includes('model not found') || lower.includes('does not exist')) {
+    return {
+      explanation: 'El modelo configurado no fue encontrado en los servidores de Google (Código 404).',
+      suggestedFix: 'Selecciona uno de los modelos válidos detectados en tu cuenta desde el selector de Ajustes.',
+    };
+  }
+  if (codeStr === '429' || lower.includes('resource_exhausted') || lower.includes('quota') || lower.includes('rate_limit')) {
+    return {
+      explanation: 'Límite de cuota excedido: has alcanzado el límite por minuto o diario de la capa gratuita (Código 429).',
+      suggestedFix: 'Desactiva la Búsqueda Web Automática en Ajustes para ahorrar cuota, usa el modelo gemini-3.1-flash-lite o espera 60 segundos.',
+    };
+  }
+  if (codeStr === '503' || codeStr === '500' || lower.includes('unavailable') || lower.includes('overloaded') || lower.includes('high demand')) {
+    return {
+      explanation: 'Los servidores de Google Gemini están experimentando alta demanda o mantenimiento temporal (Código 503).',
+      suggestedFix: 'Viernes conmuta automáticamente a los modelos de respaldo o base local determinista.',
+    };
+  }
+  if (codeStr.includes('TIMEOUT') || codeStr.includes('ETIMEDOUT') || lower.includes('timeout') || lower.includes('aborted')) {
+    return {
+      explanation: 'Tiempo de espera agotado al conectar con los servidores de Google (Timeout > 5 s).',
+      suggestedFix: 'Comprueba tu conexión a internet o verifica si el Firewall de Windows Defender o tu antivirus están bloqueando las conexiones salientes de Viernes.',
+    };
+  }
+  if (codeStr.includes('ENOTFOUND') || lower.includes('enotfound') || lower.includes('getaddrinfo')) {
+    return {
+      explanation: 'Error de resolución DNS: no se pudo resolver generativelanguage.googleapis.com (ENOTFOUND).',
+      suggestedFix: 'Verifica tu servidor DNS (ej. 8.8.8.8 o 1.1.1.1) o tu configuración de proxy en Ajustes.',
+    };
+  }
+  if (codeStr.includes('ECONNREFUSED') || lower.includes('econnrefused')) {
+    return {
+      explanation: 'Conexión rechazada localmente o por el firewall (ECONNREFUSED).',
+      suggestedFix: 'Agrega una regla en Windows Defender Firewall para permitir la salida del ejecutable de Viernes (ver comando en README_EXE.md).',
+    };
+  }
+  if (codeStr.includes('CERT') || lower.includes('certificate') || lower.includes('ssl')) {
+    return {
+      explanation: 'Fallo de verificación de certificado SSL/TLS.',
+      suggestedFix: 'Si usas un proxy corporativo o antivirus con inspección HTTPS, configura la dirección del proxy en Ajustes.',
+    };
+  }
+
+  return {
+    explanation: rawMsg || 'Error de conexión no catalogado.',
+    suggestedFix: 'Comprueba tu clave de API, conexión de red y configuración de proxy en Ajustes.',
+  };
+}
+
+// Inicialización de cliente Gemini con prioridad estricta para almacenamiento persistente
+let currentApiKey = '';
+let activeProxyUrl = '';
+
+// 1. Cargar desde archivo de credenciales de usuario (UserData)
+if (fs.existsSync(credentialsFile)) {
   try {
     const creds = JSON.parse(fs.readFileSync(credentialsFile, 'utf-8'));
-    if (creds.apiKey) currentApiKey = creds.apiKey;
-  } catch {}
+    if (creds.apiKey && creds.apiKey !== 'MY_GEMINI_API_KEY') {
+      currentApiKey = creds.apiKey;
+    }
+    if (creds.proxy && typeof creds.proxy === 'string' && creds.proxy.trim()) {
+      activeProxyUrl = creds.proxy.trim();
+      process.env.HTTPS_PROXY = activeProxyUrl;
+      process.env.HTTP_PROXY = activeProxyUrl;
+      try {
+        setGlobalDispatcher(new EnvHttpProxyAgent());
+      } catch {}
+    }
+  } catch (err: any) {
+    console.warn('[Viernes System] Error leyendo credentialsFile:', err.message);
+  }
+}
+
+// 2. Si no hay clave en UserData, usar variable de entorno como respaldo
+if (!currentApiKey && process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY') {
+  currentApiKey = process.env.GEMINI_API_KEY;
 }
 
 let aiClient: GoogleGenAI | null = null;
-function refreshAiClient(key: string) {
+export function refreshAiClient(key: string) {
   if (key && key !== 'MY_GEMINI_API_KEY') {
     currentApiKey = key;
+    process.env.GEMINI_API_KEY = key;
     aiClient = new GoogleGenAI({
       apiKey: key,
       httpOptions: {
@@ -53,15 +181,745 @@ function refreshAiClient(key: string) {
         },
       },
     });
-    console.log('[Viernes System] Gemini Client inicializado con éxito.');
+    console.log(`[Viernes System] Gemini Client inicializado con éxito (Clave terminada en ...${key.slice(-4)}).`);
   } else {
     currentApiKey = '';
     aiClient = null;
-    console.log('[Viernes System] Modo Local Offline activo.');
+    console.log('[Viernes System] Modo Local Offline activo (Sin clave de Gemini).');
   }
 }
 
 refreshAiClient(currentApiKey);
+
+// ==========================================
+// CACHÉ EN MEMORIA CON TTL DIFERENCIADO
+// ==========================================
+interface CacheEntry {
+  response: string;
+  tier: 'web' | 'gemini' | 'gemini_lite' | 'local' | 'emergency' | 'cache';
+  confidence: 'alta' | 'media' | 'baja';
+  sources: Array<{ title: string; url: string }>;
+  disclaimer?: string;
+  action?: any;
+  clarificationQuestion?: string;
+  timestamp: number;
+  ttl: number;
+}
+
+const responseCache = new Map<string, CacheEntry>();
+
+function getFromCache(key: string): CacheEntry | null {
+  const normalized = key.toLowerCase().trim();
+  const entry = responseCache.get(normalized);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > entry.ttl) {
+    responseCache.delete(normalized);
+    return null;
+  }
+  return entry;
+}
+
+function setInCache(key: string, entry: Omit<CacheEntry, 'timestamp'>) {
+  const normalized = key.toLowerCase().trim();
+  responseCache.set(normalized, {
+    ...entry,
+    timestamp: Date.now(),
+  });
+  // Mantener un tamaño controlado de caché
+  if (responseCache.size > 200) {
+    const firstKey = responseCache.keys().next().value;
+    if (firstKey) responseCache.delete(firstKey);
+  }
+}
+
+// ==========================================
+// AUXILIARES: TIMEOUT, RETROCESO Y URL SCRAPING
+// ==========================================
+function withTimeout<T>(promise: Promise<T>, timeoutMs = 12000, label = 'Operación'): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Timeout de ${timeoutMs}ms excedido en ${label}`));
+    }, timeoutMs);
+    promise
+      .then((res) => {
+        clearTimeout(timer);
+        resolve(res);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+async function callWithBackoff<T>(fn: () => Promise<T>, maxRetries = 1, label = 'Petición'): Promise<T> {
+  let delay = 600;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await withTimeout(fn(), 10000, `${label} (Intento ${attempt + 1})`);
+    } catch (err: any) {
+      const isQuotaExhausted = 
+        err?.status === 429 || 
+        err?.statusCode === 429 || 
+        (err?.message && (err.message.includes('429') || err.message.includes('RESOURCE_EXHAUSTED') || err.message.includes('quota')));
+
+      if (isQuotaExhausted) {
+        console.warn(`[Viernes System] ${label}: Cuota agotada (429). Pasando de inmediato al siguiente nivel de la cadena.`);
+        throw err;
+      }
+
+      const isTransient = 
+        err?.status === 503 || 
+        (err?.message && (err.message.includes('503') || err.message.includes('fetch failed') || err.message.includes('UNAVAILABLE')));
+      
+      if (isTransient && attempt < maxRetries) {
+        console.warn(`[Viernes System] ${label}: Reintentando tras incidencia transitoria (${attempt + 1} de ${maxRetries})...`);
+        await new Promise((r) => setTimeout(r, delay));
+        delay *= 2;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(`${label}: Máximo de reintentos agotado.`);
+}
+
+async function fetchUrlSummary(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ViernesAssistant/4.2',
+      },
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return `(No se pudo acceder a ${url}: HTTP ${res.status})`;
+    const html = await res.text();
+    // Limpieza de etiquetas para extraer contenido legible
+    const bodyContent = html
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return bodyContent.slice(0, 3500);
+  } catch (e: any) {
+    return `(Error de red al consultar ${url}: ${e.message})`;
+  }
+}
+
+function detectSensitiveTopic(message: string): { type: 'medical' | 'legal' | 'financial'; disclaimer: string } | null {
+  const lower = message.toLowerCase();
+  if (/\b(dolor|fiebre|s[ií]ntoma|medicamento|enfermedad|m[eé]dico|pastilla|tratamiento|diagn[oó]stico|salud|dosis|infecci[oó]n)\b/i.test(lower)) {
+    return {
+      type: 'medical',
+      disclaimer: 'Nota de seguridad: Esta orientación es informativa y no sustituye la valoración médica profesional. Ante síntomas persistentes o urgencias, consulta de inmediato a un médico certificado.',
+    };
+  }
+  if (/\b(ley|abogado|demanda|juicio|contrato|delito|legal|jur[ií]dico|c[oó]digo penal|herencia|testamento)\b/i.test(lower)) {
+    return {
+      type: 'legal',
+      disclaimer: 'Nota legal: La normativa jurídica varía según el país y jurisdicción. Para trámites o litigios formales, acude a un abogado o notario colegiado.',
+    };
+  }
+  if (/\b(invertir|inversi[oó]n|acciones|cripto|bolsa|ahorro|inter[eé]s compuesto|pr[eé]stamo|hipoteca|patrimonio)\b/i.test(lower)) {
+    return {
+      type: 'financial',
+      disclaimer: 'Nota financiera: Esta información tiene fines divulgativos y no constituye asesoramiento financiero ni recomendación de inversión.',
+    };
+  }
+  return null;
+}
+
+function getRelevantMemories(query: string, memories: any[], maxCount = 5): any[] {
+  if (!Array.isArray(memories) || memories.length === 0) return [];
+  const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  
+  const scored = memories.map(m => {
+    let score = 0;
+    const text = `${m.title || ''} ${m.content || ''} ${m.category || ''}`.toLowerCase();
+    for (const w of words) {
+      if (text.includes(w)) score += 2;
+    }
+    score += (m.accessCount || 0) * 0.1;
+    return { memory: m, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, maxCount).map(s => s.memory);
+}
+
+// ==========================================
+// MOTOR DE RESPUESTA UNIVERSAL: answerEverything
+// ==========================================
+export interface AnswerEverythingOptions {
+  message: string;
+  history?: Array<{ role: string; content?: string; text?: string }>;
+  memories?: any[];
+  notifications?: any[];
+  settings?: any;
+  systemContext?: any;
+  onChunk?: (chunk: string) => void;
+}
+
+export interface AnswerResult {
+  response: string;
+  tier: 'web' | 'gemini' | 'gemini_lite' | 'local' | 'emergency' | 'cache';
+  confidence: 'alta' | 'media' | 'baja';
+  sources: Array<{ title: string; url: string }>;
+  disclaimer?: string;
+  action?: any;
+  clarificationQuestion?: string;
+  isCorrection?: boolean;
+}
+
+export async function answerEverything(options: AnswerEverythingOptions): Promise<AnswerResult> {
+  const {
+    message,
+    history = [],
+    memories = [],
+    notifications = [],
+    settings = {},
+    systemContext = {},
+    onChunk,
+  } = options;
+
+  const startTime = Date.now();
+  const rawMessage = (message || '').trim();
+  if (!rawMessage) {
+    return {
+      response: 'Comando vacío recibido. Sistemas tácticos de Viernes a la espera de instrucciones.',
+      tier: 'local',
+      confidence: 'alta',
+      sources: [],
+    };
+  }
+
+  // 1. Clasificación previa de la intención
+  const intent = IntentRouter.classify(rawMessage);
+  const sensitive = detectSensitiveTopic(rawMessage);
+
+  // 2. Comprobación de Caché (si no es comando local ni forzado)
+  const isCacheable = intent.category !== 'LOCAL_COMMAND';
+  if (isCacheable) {
+    const cached = getFromCache(rawMessage);
+    if (cached) {
+      console.log(`[Viernes System] Respondió Nivel: Caché Inteligente (TTL ${Math.round(cached.ttl / 1000)}s)`);
+      if (onChunk) onChunk(cached.response);
+      return {
+        ...cached,
+        tier: 'cache',
+      };
+    }
+  }
+
+  // 3. Ejecución directa de comandos locales rápidos (calculadora, notas, temporizador, memorias)
+  if (intent.category === 'LOCAL_COMMAND' && intent.localAction) {
+    const act = intent.localAction;
+    const responseText = act.directAnswer || 'Ejecutando comando de sistema local.';
+    console.log(`[Viernes System] Respondió Nivel: Tier 4 (Comando Local Directo - ${act.type})`);
+    if (onChunk) onChunk(responseText);
+
+    const actionResult = {
+      type: act.type,
+      app: act.app,
+      query: act.query,
+      seconds: act.seconds,
+      label: act.label,
+      title: act.title,
+      content: act.content,
+      name: act.routineName,
+    };
+
+    return {
+      response: responseText,
+      tier: 'local',
+      confidence: 'alta',
+      sources: [],
+      action: actionResult,
+    };
+  }
+
+  // 4. Cálculo matemático exacto local
+  if (intent.category === 'CALCULATION' && intent.localAction?.directAnswer) {
+    const calcText = intent.localAction.directAnswer;
+    console.log('[Viernes System] Respondió Nivel: Tier 4 (Evaluador Matemático Determinista)');
+    if (onChunk) onChunk(calcText);
+    return {
+      response: calcText,
+      tier: 'local',
+      confidence: 'alta',
+      sources: [],
+    };
+  }
+
+  // Preparar contexto del prompt
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('es-ES', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const timeStr = now.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const city = settings.userCity || systemContext.city || 'Madrid';
+  const timezone = settings.userTimezone || systemContext.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Madrid';
+
+  // Seleccionar top 5 memorias más relevantes
+  const relevantMems = getRelevantMemories(rawMessage, memories, 5);
+  const memorySummaries = relevantMems.length > 0
+    ? relevantMems.map(m => `- [${m.type || 'DATO'}] ${m.title || ''}: ${m.content || ''}`).join('\n')
+    : 'No hay memorias previas registradas.';
+
+  // Notificaciones recientes
+  const notifsList = Array.isArray(notifications) && notifications.length > 0 ? notifications : [];
+  const notifsSummary = notifsList.length > 0
+    ? notifsList.slice(0, 10).map(n => `- [${n.app}] ${n.title ? n.title + ': ' : ''}${n.text || ''}`).join('\n')
+    : 'No hay notificaciones recientes en la bandeja del sistema.';
+
+  // Lectura de URL si está presente
+  let urlScrapedContent = '';
+  if (intent.urls.length > 0) {
+    console.log(`[Viernes System] Inspeccionando ${intent.urls.length} enlace(s) web...`);
+    const summaries = await Promise.all(intent.urls.slice(0, 2).map(u => fetchUrlSummary(u)));
+    urlScrapedContent = intent.urls.map((u, i) => `CONTENIDO EXTRAÍDO DE ${u}:\n${summaries[i]}`).join('\n\n');
+  }
+
+  // Formular longitud de respuesta
+  const lengthInstruction = settings.responseLength === 'detallada'
+    ? 'El usuario prefiere respuestas completas, explicativas y profundas.'
+    : settings.responseLength === 'normal'
+    ? 'Responde de forma clara y equilibrada en 2-3 párrafos concisos.'
+    : 'Responde SIEMPRE directo y breve (máximo 3-4 frases para síntesis de voz; más detalle solo si te lo piden expresamente).';
+
+  // Prompt de Sistema Estricto (Requisito 3)
+  const systemInstruction = `Eres Viernes, asistente personal inteligente inspirado en la interfaz táctica de Industrias Stark. Responde SIEMPRE, nunca digas solo "no sé". Si la pregunta es clara, responde directo y breve (${lengthInstruction}). Si necesitas datos actuales, usa la búsqueda. Si no estás seguro, da tu mejor respuesta indicando el nivel de confianza (alta/media/baja) y qué conviene verificar. Si la pregunta es ambigua, asume la interpretación más probable, responde y pregunta al final. Si algo es peligroso, ilegal o fuera de tus capacidades, explícalo en una frase y ofrece una alternativa útil. Usa el contexto de la memoria del usuario y de la conversación reciente. No inventes datos, cifras, fuentes ni enlaces: si no los tienes, dilo.
+
+DATOS TEMPORALES Y GEOGRÁFICOS EXACTOS:
+- Fecha actual: ${dateStr}
+- Hora actual: ${timeStr}
+- Zona horaria: ${timezone}
+- Ciudad de operación: ${city}
+
+BANCO DE MEMORIA RELEVANTE (TOP 5):
+${memorySummaries}
+
+NOTIFICACIONES ACTIVAS DE WINDOWS:
+${notifsSummary}
+
+${urlScrapedContent ? `ANÁLISIS DE ENLACES WEB PROPORCIONADOS:\n${urlScrapedContent}\n` : ''}
+
+DIRECTRICES DE ACCIÓN:
+Si el usuario solicita abrir una aplicación o activar un temporizador, adjunta al final en una línea aislada:
+[[ACTION:{"type":"OPEN_APP"|"TIMER"|"SAVE_MEMORY"|"ROUTINE","app":"youtube"|"spotify"|"whatsapp"|"maps"|"calendar"|"gmail"|"notes"|"calculator","query":"...","seconds":60}]]`;
+
+  // Historial de conversación (últimos 10 mensajes)
+  const contents: any[] = [];
+  if (Array.isArray(history)) {
+    for (const item of history.slice(-10)) {
+      contents.push({
+        role: item.role === 'model' || item.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: item.text || item.content || '' }],
+      });
+    }
+  }
+
+  contents.push({
+    role: 'user',
+    parts: [{ text: rawMessage }],
+  });
+
+  const primaryModel = settings.model || 'gemini-3.8-flash';
+  const fallbackModel = settings.fallbackModel || 'gemini-3.1-flash-lite';
+  const autoSearch = settings.autoWebSearch !== false;
+  const shouldSearch = (intent.requiresSearch || intent.category === 'CORRECTION') && autoSearch;
+
+  // ==========================================
+  // TIER 1: GEMINI PRINCIPAL CON BÚSQUEDA WEB
+  // ==========================================
+  if (aiClient && shouldSearch) {
+    try {
+      console.log(`[Viernes System] Intentando Tier 1: ${primaryModel} con Google Search Grounding...`);
+      let streamAccumulator = '';
+      const sources: Array<{ title: string; url: string }> = [];
+
+      if (onChunk) {
+        const responseStream = await callWithBackoff(() =>
+          aiClient!.models.generateContentStream({
+            model: primaryModel,
+            contents,
+            config: {
+              systemInstruction,
+              temperature: 0.65,
+              tools: [{ googleSearch: {} }],
+            },
+          }),
+          1,
+          'Tier 1 (Gemini Search Stream)'
+        );
+
+        let lastCandidate: any = null;
+        for await (const chunk of responseStream) {
+          const chunkText = chunk.text || '';
+          if (chunkText) {
+            streamAccumulator += chunkText;
+            onChunk(chunkText);
+          }
+          if (chunk.candidates?.[0]) lastCandidate = chunk.candidates[0];
+        }
+
+        const metadata = lastCandidate?.groundingMetadata;
+        if (metadata?.groundingChunks) {
+          for (const gc of metadata.groundingChunks) {
+            if (gc.web?.uri) {
+              let host = gc.web.uri;
+              try { host = new URL(gc.web.uri).hostname.replace(/^www\./, ''); } catch {}
+              sources.push({ title: gc.web.title || host, url: gc.web.uri });
+            }
+          }
+        }
+      } else {
+        const response = await callWithBackoff(() =>
+          aiClient!.models.generateContent({
+            model: primaryModel,
+            contents,
+            config: {
+              systemInstruction,
+              temperature: 0.65,
+              tools: [{ googleSearch: {} }],
+            },
+          }),
+          1,
+          'Tier 1 (Gemini Search Direct)'
+        );
+
+        streamAccumulator = response.text || '';
+        const metadata = response.candidates?.[0]?.groundingMetadata;
+        if (metadata?.groundingChunks) {
+          for (const gc of metadata.groundingChunks) {
+            if (gc.web?.uri) {
+              let host = gc.web.uri;
+              try { host = new URL(gc.web.uri).hostname.replace(/^www\./, ''); } catch {}
+              sources.push({ title: gc.web.title || host, url: gc.web.uri });
+            }
+          }
+        }
+      }
+
+      const uniqueSources = sources.filter((v, i, a) => a.findIndex(t => t.url === v.url) === i);
+      const cleaned = cleanAssistantResponse(streamAccumulator);
+
+      if (cleaned.text) {
+        const elapsed = Date.now() - startTime;
+        console.log('[Viernes System] Respondió Nivel: Tier 1 (Gemini con Búsqueda en Google)');
+        logConnectionEvent('Tier 1 (Google Search)', 200, elapsed, `Búsqueda en Google exitosa con ${uniqueSources.length} fuentes`);
+        const finalResult: AnswerResult = {
+          response: appendSensitiveDisclaimer(cleaned.text, sensitive?.disclaimer),
+          tier: 'web',
+          confidence: 'alta',
+          sources: uniqueSources,
+          disclaimer: sensitive?.disclaimer,
+          action: cleaned.action,
+          clarificationQuestion: intent.category === 'AMBIGUOUS' ? intent.suggestedClarification : undefined,
+          isCorrection: intent.category === 'CORRECTION',
+        };
+        // TTL de 3 minutos para datos en tiempo real
+        setInCache(rawMessage, { ...finalResult, ttl: 180000 });
+        return finalResult;
+      }
+    } catch (err: any) {
+      const elapsed = Date.now() - startTime;
+      console.warn('[Viernes System] Tier 1 falló:', err.message);
+      logConnectionEvent('Tier 1 (Google Search)', err.status || err.code || 'ERROR', elapsed, err.message || 'Fallo en búsqueda');
+    }
+  }
+
+  // ==========================================
+  // TIER 2: GEMINI PRINCIPAL SIN BÚSQUEDA
+  // ==========================================
+  if (aiClient) {
+    try {
+      console.log(`[Viernes System] Intentando Tier 2: ${primaryModel} estándar...`);
+      let streamAccumulator = '';
+
+      if (onChunk) {
+        const responseStream = await callWithBackoff(() =>
+          aiClient!.models.generateContentStream({
+            model: primaryModel,
+            contents,
+            config: {
+              systemInstruction,
+              temperature: 0.7,
+            },
+          }),
+          1,
+          'Tier 2 (Gemini Direct Stream)'
+        );
+
+        for await (const chunk of responseStream) {
+          const chunkText = chunk.text || '';
+          if (chunkText) {
+            streamAccumulator += chunkText;
+            onChunk(chunkText);
+          }
+        }
+      } else {
+        const response = await callWithBackoff(() =>
+          aiClient!.models.generateContent({
+            model: primaryModel,
+            contents,
+            config: {
+              systemInstruction,
+              temperature: 0.7,
+            },
+          }),
+          1,
+          'Tier 2 (Gemini Direct)'
+        );
+        streamAccumulator = response.text || '';
+      }
+
+      const cleaned = cleanAssistantResponse(streamAccumulator);
+      if (cleaned.text) {
+        const elapsed = Date.now() - startTime;
+        console.log('[Viernes System] Respondió Nivel: Tier 2 (Gemini Estándar)');
+        logConnectionEvent('Tier 2 (Gemini Direct)', 200, elapsed, `Modelo principal ${primaryModel} respondió`);
+        const finalResult: AnswerResult = {
+          response: appendSensitiveDisclaimer(cleaned.text, sensitive?.disclaimer),
+          tier: 'gemini',
+          confidence: intent.category === 'CURRENT_INFO' ? 'media' : 'alta',
+          sources: [],
+          disclaimer: sensitive?.disclaimer,
+          action: cleaned.action,
+          clarificationQuestion: intent.category === 'AMBIGUOUS' ? intent.suggestedClarification : undefined,
+          isCorrection: intent.category === 'CORRECTION',
+        };
+        // TTL de 2 horas para conocimiento general
+        setInCache(rawMessage, { ...finalResult, ttl: 7200000 });
+        return finalResult;
+      }
+    } catch (err: any) {
+      const elapsed = Date.now() - startTime;
+      console.warn('[Viernes System] Tier 2 falló:', err.message);
+      logConnectionEvent('Tier 2 (Gemini Direct)', err.status || err.code || 'ERROR', elapsed, err.message || 'Fallo modelo principal');
+    }
+  }
+
+  // ==========================================
+  // TIER 3: MODELO ALTERNATIVO MÁS LIGERO
+  // ==========================================
+  if (aiClient) {
+    try {
+      console.log(`[Viernes System] Intentando Tier 3: ${fallbackModel} ligero...`);
+      let streamAccumulator = '';
+
+      if (onChunk) {
+        const responseStream = await callWithBackoff(() =>
+          aiClient!.models.generateContentStream({
+            model: fallbackModel,
+            contents,
+            config: {
+              systemInstruction,
+              temperature: 0.7,
+            },
+          }),
+          1,
+          'Tier 3 (Gemini Flash Lite Stream)'
+        );
+
+        for await (const chunk of responseStream) {
+          const chunkText = chunk.text || '';
+          if (chunkText) {
+            streamAccumulator += chunkText;
+            onChunk(chunkText);
+          }
+        }
+      } else {
+        const response = await callWithBackoff(() =>
+          aiClient!.models.generateContent({
+            model: fallbackModel,
+            contents,
+            config: {
+              systemInstruction,
+              temperature: 0.7,
+            },
+          }),
+          1,
+          'Tier 3 (Gemini Flash Lite Direct)'
+        );
+        streamAccumulator = response.text || '';
+      }
+
+      const cleaned = cleanAssistantResponse(streamAccumulator);
+      if (cleaned.text) {
+        const elapsed = Date.now() - startTime;
+        console.log('[Viernes System] Respondió Nivel: Tier 3 (Gemini Alternativo Ligero)');
+        logConnectionEvent('Tier 3 (Gemini Lite)', 200, elapsed, `Modelo ligero ${fallbackModel} respondió`);
+        const finalResult: AnswerResult = {
+          response: appendSensitiveDisclaimer(cleaned.text, sensitive?.disclaimer),
+          tier: 'gemini_lite',
+          confidence: 'media',
+          sources: [],
+          disclaimer: sensitive?.disclaimer,
+          action: cleaned.action,
+          clarificationQuestion: intent.category === 'AMBIGUOUS' ? intent.suggestedClarification : undefined,
+        };
+        return finalResult;
+      }
+    } catch (err: any) {
+      const elapsed = Date.now() - startTime;
+      console.warn('[Viernes System] Tier 3 falló:', err.message);
+      logConnectionEvent('Tier 3 (Gemini Lite)', err.status || err.code || 'ERROR', elapsed, err.message || 'Fallo modelo ligero');
+    }
+  }
+
+  // ==========================================
+  // TIER 4: BASE LOCAL DETERMINISTA
+  // ==========================================
+  console.log('[Viernes System] Intentando Tier 4: Base Local Determinista Stark...');
+  const localResponse = executeLocalDeterministicEngine(rawMessage, {
+    memories,
+    notifications,
+    city,
+    dateStr,
+    timeStr,
+  });
+
+  if (localResponse) {
+    const elapsed = Date.now() - startTime;
+    console.log('[Viernes System] Respondió Nivel: Tier 4 (Base Local Determinista)');
+    logConnectionEvent('Tier 4 (Base Local)', 200, elapsed, 'Respuesta determinista local ejecutada');
+    if (onChunk) onChunk(localResponse.text);
+    return {
+      response: appendSensitiveDisclaimer(localResponse.text, sensitive?.disclaimer),
+      tier: 'local',
+      confidence: localResponse.confidence,
+      sources: [],
+      disclaimer: sensitive?.disclaimer,
+      action: localResponse.action,
+      clarificationQuestion: intent.category === 'AMBIGUOUS' ? intent.suggestedClarification : undefined,
+    };
+  }
+
+  // ==========================================
+  // TIER 5: MENSAJE FINAL DE EMERGENCIA
+  // ==========================================
+  const elapsed = Date.now() - startTime;
+  console.log('[Viernes System] Respondió Nivel: Tier 5 (Mensaje de Emergencia Táctica)');
+  logConnectionEvent('Tier 5 (Emergencia)', 503, elapsed, 'Mensaje de contingencia final activado');
+  const emergencyText = `Sistemas de enlace táctico exterior temporalmente no disponibles debido a desconexión de red o cuota de servicio. En este momento mantengo operativos al 100% todos los subsistemas locales: temporizadores, calculadora, notas rápidas, apertura de aplicaciones de escritorio y consulta de tu banco de memoria. Puedes pulsar 'Reintentar' o configurar tu clave en Ajustes.`;
+  if (onChunk) onChunk(emergencyText);
+
+  return {
+    response: emergencyText,
+    tier: 'emergency',
+    confidence: 'baja',
+    sources: [],
+    disclaimer: sensitive?.disclaimer,
+  };
+}
+
+function cleanAssistantResponse(text: string): { text: string; action?: any } {
+  let cleaned = text.trim();
+  let action: any = null;
+
+  const actionMatch = cleaned.match(/\[\[ACTION:(.*?)\]\]/s);
+  if (actionMatch) {
+    try {
+      action = JSON.parse(actionMatch[1].trim());
+      cleaned = cleaned.replace(actionMatch[0], '').trim();
+    } catch {}
+  }
+
+  return { text: cleaned, action };
+}
+
+function appendSensitiveDisclaimer(text: string, disclaimer?: string): string {
+  if (!disclaimer) return text;
+  if (text.includes(disclaimer)) return text;
+  return `${text}\n\n*${disclaimer}*`;
+}
+
+function executeLocalDeterministicEngine(message: string, ctx: { memories: any[]; notifications: any[]; city: string; dateStr: string; timeStr: string }): { text: string; confidence: 'alta' | 'media' | 'baja'; action?: any } | null {
+  const lower = message.toLowerCase().trim();
+
+  // 1. Saludos y Estado
+  if (/^(hola|oye viernes|buenos d[ií]as|buenas tardes|buenas noches|qu[eé] tal|quien eres|qui[eé]n eres)/i.test(lower)) {
+    return {
+      text: `Sistemas en línea, jefe. Protocolos tácticos de Viernes operando en modo local. Son las ${ctx.timeStr} en ${ctx.city}. ¿En qué puedo asistirte?`,
+      confidence: 'alta',
+    };
+  }
+
+  // 2. Fecha y Hora
+  if (/\b(qu[eé] hora es|la hora|qu[eé] d[ií]a es|la fecha|qu[eé] fecha)\b/i.test(lower)) {
+    return {
+      text: `Hoy es ${ctx.dateStr} y son exactamente las ${ctx.timeStr} en ${ctx.city}.`,
+      confidence: 'alta',
+    };
+  }
+
+  // 3. Notificaciones y WhatsApp
+  if (lower.includes('whatsapp') && (lower.includes('tengo') || lower.includes('hay') || lower.includes('mensaje'))) {
+    const wa = ctx.notifications.filter(n => (n.app || '').toLowerCase().includes('whatsapp'));
+    if (wa.length > 0) {
+      const summary = wa.map(n => `${n.title ? n.title + ': ' : ''}${n.text}`).join(' | ');
+      return {
+        text: `Tienes ${wa.length} notificación(es) de WhatsApp: ${summary}`,
+        confidence: 'alta',
+      };
+    }
+    return {
+      text: 'No tienes notificaciones pendientes de WhatsApp en este momento, jefe.',
+      confidence: 'alta',
+    };
+  }
+
+  if (lower.includes('notificación') || lower.includes('notificaciones') || lower.includes('resume mis notificaciones')) {
+    if (ctx.notifications.length > 0) {
+      const summary = ctx.notifications.slice(0, 5).map((n, i) => `${i + 1}. [${n.app}] ${n.title}: ${n.text}`).join('. ');
+      return {
+        text: `Tienes ${ctx.notifications.length} notificación(es) registradas en Windows: ${summary}`,
+        confidence: 'alta',
+      };
+    }
+    return {
+      text: 'No hay notificaciones pendientes en la base de datos del sistema.',
+      confidence: 'alta',
+    };
+  }
+
+  // 4. Búsqueda en Banco de Memoria
+  if (ctx.memories && ctx.memories.length > 0) {
+    const words = lower.split(/\s+/).filter(w => w.length > 3 && !['sobre', 'para', 'como', 'cual', 'cuál'].includes(w));
+    for (const mem of ctx.memories) {
+      const memText = `${mem.title || ''} ${mem.content || ''}`.toLowerCase();
+      if (words.some(w => memText.includes(w))) {
+        return {
+          text: `Según tu banco de memoria registrado: ${mem.title} — "${mem.content}".`,
+          confidence: 'alta',
+        };
+      }
+    }
+  }
+
+  // 5. Conversiones comunes básicas
+  if (/\b(\d+)\s*(km|kil[oó]metros?)\s*(a|en)\s*(millas?)\b/i.test(lower)) {
+    const m = lower.match(/(\d+)\s*(km|kil[oó]metros?)/i);
+    if (m) {
+      const km = parseFloat(m[1]);
+      const miles = (km * 0.621371).toFixed(2);
+      return { text: `${km} kilómetros equivalen exactamente a ${miles} millas.`, confidence: 'alta' };
+    }
+  }
+
+  // 6. Respuesta táctica por defecto (honestidad y directrices para verificar)
+  return {
+    text: `Operando bajo el protocolo local de contingencia. Respecto a "${message}": no dispongo de conexión satelital para verificar datos en tiempo real en este momento. Con confianza moderada te recomiendo consultar tus notas o verificar la conexión en Ajustes para activar Google Search Grounding.`,
+    confidence: 'media',
+  };
+}
+
+// ==========================================
+// ENDPOINTS DE LA API
+// ==========================================
 
 // 1. Health check & Ping
 app.get('/api/assistant/health', (req, res) => {
@@ -75,13 +933,394 @@ app.get('/api/assistant/health', (req, res) => {
   });
 });
 
-// 2. API Key management
+// 2. Comprobación Rápida de Internet Real (Ping saliente cada 15s con timeout de 5s)
+app.get('/api/assistant/check-internet', async (req, res) => {
+  const start = Date.now();
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const response = await fetch('https://www.google.com/generate_204', {
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    clearTimeout(timeout);
+    const latencyMs = Date.now() - start;
+    const isOnline = response.status === 204 || response.status === 200;
+    return res.json({
+      online: isOnline,
+      status: response.status,
+      latencyMs,
+      proxy: process.env.HTTPS_PROXY || 'DIRECT',
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    const latencyMs = Date.now() - start;
+    return res.json({
+      online: false,
+      error: err.code || err.name || 'TIMEOUT',
+      message: err.message,
+      latencyMs,
+      proxy: process.env.HTTPS_PROXY || 'DIRECT',
+      timestamp: Date.now(),
+    });
+  }
+});
+
+// Función auxiliar para listar modelos disponibles para una clave
+async function fetchAvailableModels(apiKey: string): Promise<string[]> {
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') return [];
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return [];
+    const data: any = await res.json();
+    if (data && Array.isArray(data.models)) {
+      return data.models
+        .filter((m: any) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+        .map((m: any) => m.name.replace(/^models\//, ''))
+        .filter((name: string) => name.toLowerCase().includes('gemini'));
+    }
+  } catch {}
+  return [];
+}
+
+// 3. Panel de Diagnóstico Integral de Conectividad (Requisito 1)
+app.get('/api/assistant/diagnostics/full', async (req, res) => {
+  const primaryModel = (req.query.model as string) || 'gemini-3.8-flash';
+  const fallbackModel = (req.query.fallbackModel as string) || 'gemini-3.1-flash-lite';
+  
+  const startTime = Date.now();
+  const report: any = {
+    timestamp: Date.now(),
+    overallSuccess: true,
+    tests: {},
+  };
+
+  // Test A: Internet General (petición a https://www.google.com/generate_204)
+  const tAStart = Date.now();
+  try {
+    const cA = new AbortController();
+    const tA = setTimeout(() => cA.abort(), 5000);
+    const resA = await fetch('https://www.google.com/generate_204', { signal: cA.signal, cache: 'no-store' });
+    clearTimeout(tA);
+    const latA = Date.now() - tAStart;
+    const okA = resA.status === 204 || resA.status === 200;
+    report.tests.internet = {
+      id: 'internet',
+      name: 'Internet General (Google 204)',
+      passed: okA,
+      code: resA.status,
+      latencyMs: latA,
+      message: okA ? 'Conexión a internet verificada con éxito (Google 204 OK).' : `Respuesta anómala de red (Estado ${resA.status}).`,
+    };
+    if (!okA) report.overallSuccess = false;
+  } catch (err: any) {
+    const latA = Date.now() - tAStart;
+    const exp = explainErrorCode(err.code || 'TIMEOUT', err.message);
+    report.tests.internet = {
+      id: 'internet',
+      name: 'Internet General (Google 204)',
+      passed: false,
+      code: err.code || 'TIMEOUT',
+      latencyMs: latA,
+      message: exp.explanation,
+      suggestedFix: exp.suggestedFix,
+    };
+    report.overallSuccess = false;
+  }
+
+  // Test B: Alcance de la API (petición a generativelanguage.googleapis.com)
+  const tBStart = Date.now();
+  try {
+    const cB = new AbortController();
+    const tB = setTimeout(() => cB.abort(), 5000);
+    const resB = await fetch('https://generativelanguage.googleapis.com', { signal: cB.signal });
+    clearTimeout(tB);
+    const latB = Date.now() - tBStart;
+    // Si responde (incluso 404 raíz), el host es alcanzable y el handshake SSL funciona
+    report.tests.apiReachability = {
+      id: 'api_reach',
+      name: 'Alcance de la API de Google Gemini',
+      passed: true,
+      code: resB.status,
+      latencyMs: latB,
+      message: 'Servidores de Google Gemini alcanzables mediante HTTPS sin bloqueos DNS/SSL.',
+    };
+  } catch (err: any) {
+    const latB = Date.now() - tBStart;
+    const exp = explainErrorCode(err.code || 'TIMEOUT', err.message);
+    report.tests.apiReachability = {
+      id: 'api_reach',
+      name: 'Alcance de la API de Google Gemini',
+      passed: false,
+      code: err.code || 'ENOTFOUND',
+      latencyMs: latB,
+      message: exp.explanation,
+      suggestedFix: exp.suggestedFix,
+    };
+    report.overallSuccess = false;
+  }
+
+  // Test C: API Key (validación de formato y almacenamiento seguro)
+  const hasKey = !!currentApiKey && currentApiKey !== 'MY_GEMINI_API_KEY';
+  const hasValidFormat = hasKey && (currentApiKey.startsWith('AIza') || currentApiKey.length >= 25);
+  const masked = hasKey ? '••••••••••••••••' + currentApiKey.slice(-4) : '';
+  const storageLocation = fs.existsSync(credentialsFile)
+    ? `Almacenamiento persistente UserData (${credentialsFile})`
+    : 'Variables de entorno (.env)';
+
+  report.tests.apiKey = {
+    id: 'api_key',
+    name: 'Clave de API Gemini',
+    passed: hasKey && hasValidFormat,
+    maskedKey: masked,
+    storageLocation,
+    message: !hasKey
+      ? 'No se ha configurado ninguna clave de API. Viernes está operando en modo local determinista.'
+      : !hasValidFormat
+      ? 'La clave no tiene el formato estándar de Google AI Studio (debe empezar con AIza y tener más de 30 caracteres).'
+      : `Clave cargada correctamente desde ${storageLocation} (terminada en ...${currentApiKey.slice(-4)}).`,
+    suggestedFix: !hasKey
+      ? 'Consigue tu clave gratuita en https://aistudio.google.com y pégala en el campo de Ajustes.'
+      : !hasValidFormat
+      ? 'Verifica que hayas copiado la clave completa sin espacios extra.'
+      : undefined,
+  };
+  if (!hasKey || !hasValidFormat) report.overallSuccess = false;
+
+  // Test D: Modelos (Llamada mínima "Responde OK" a modelo principal y de respaldo)
+  if (!hasKey || !aiClient) {
+    report.tests.models = {
+      id: 'models',
+      name: 'Modelos de Lenguaje (Principal y Respaldo)',
+      passed: false,
+      primaryModel,
+      fallbackModel,
+      message: 'Prueba de modelos omitida: se requiere una clave de API configurada.',
+      suggestedFix: 'Configura tu clave en Ajustes para probar los modelos.',
+    };
+  } else {
+    let primaryOk = false;
+    let fallbackOk = false;
+    let primaryErrCode: any = null;
+    let primaryErrMsg = '';
+    let availableModels: string[] = [];
+
+    // Prueba modelo principal
+    try {
+      const respP = await withTimeout(
+        aiClient.models.generateContent({
+          model: primaryModel,
+          contents: 'Responde estrictamente "OK"',
+          config: { maxOutputTokens: 5, temperature: 0.1 },
+        }),
+        7000
+      );
+      primaryOk = !!respP.text;
+    } catch (err: any) {
+      primaryErrCode = err.status || err.code || 'ERROR';
+      primaryErrMsg = err.message || '';
+      console.warn(`[Viernes System] Diagnóstico: Modelo principal (${primaryModel}) falló:`, primaryErrMsg);
+    }
+
+    // Prueba modelo de respaldo
+    try {
+      const respF = await withTimeout(
+        aiClient.models.generateContent({
+          model: fallbackModel,
+          contents: 'Responde estrictamente "OK"',
+          config: { maxOutputTokens: 5, temperature: 0.1 },
+        }),
+        7000
+      );
+      fallbackOk = !!respF.text;
+    } catch (err: any) {
+      console.warn(`[Viernes System] Diagnóstico: Modelo respaldo (${fallbackModel}) falló:`, err.message);
+    }
+
+    // Si falló por 404 / no encontrado, listar modelos disponibles para esa clave
+    if (!primaryOk && (String(primaryErrCode) === '404' || primaryErrMsg.toLowerCase().includes('not_found') || primaryErrMsg.toLowerCase().includes('does not exist'))) {
+      availableModels = await fetchAvailableModels(currentApiKey);
+    }
+
+    const expP = primaryErrCode ? explainErrorCode(primaryErrCode, primaryErrMsg) : null;
+    report.tests.models = {
+      id: 'models',
+      name: 'Modelos de Lenguaje (Principal y Respaldo)',
+      passed: primaryOk || fallbackOk,
+      primaryModel,
+      primaryOk,
+      fallbackModel,
+      fallbackOk,
+      code: primaryErrCode,
+      availableModels: availableModels.length > 0 ? availableModels : undefined,
+      message: primaryOk
+        ? `Modelo principal (${primaryModel}) y de respaldo (${fallbackModel}) operativos.`
+        : fallbackOk
+        ? `Modelo principal (${primaryModel}) no respondió, pero el de respaldo (${fallbackModel}) está disponible.`
+        : expP?.explanation || 'Ambos modelos fallaron en la comprobación.',
+      suggestedFix: primaryOk
+        ? undefined
+        : availableModels.length > 0
+        ? `El modelo no existe para esta clave. Elige uno de los modelos válidos detectados: ${availableModels.slice(0, 4).join(', ')}`
+        : expP?.suggestedFix,
+    };
+    if (!primaryOk && !fallbackOk) report.overallSuccess = false;
+  }
+
+  // Test E: Búsqueda de Google (Grounding)
+  if (!hasKey || !aiClient) {
+    report.tests.grounding = {
+      id: 'grounding',
+      name: 'Búsqueda de Google (Search Grounding)',
+      passed: false,
+      message: 'Prueba de búsqueda omitida: se requiere una clave de API válida.',
+    };
+  } else {
+    try {
+      const respG = await withTimeout(
+        aiClient.models.generateContent({
+          model: primaryModel,
+          contents: 'Dime brevemente qué hora es en Tokio hoy',
+          config: { maxOutputTokens: 10, tools: [{ googleSearch: {} }] },
+        }),
+        8000
+      );
+      const passedG = !!respG.text;
+      report.tests.grounding = {
+        id: 'grounding',
+        name: 'Búsqueda de Google (Search Grounding)',
+        passed: passedG,
+        message: passedG
+          ? 'Herramienta de búsqueda en tiempo real operativa (Google Search Grounding activo).'
+          : 'La búsqueda no devolvió datos estructurados.',
+      };
+    } catch (err: any) {
+      const codeG = err.status || err.code || 'ERROR';
+      const isQuota = String(codeG) === '429' || err.message?.toLowerCase().includes('quota') || err.message?.toLowerCase().includes('resource_exhausted');
+      report.tests.grounding = {
+        id: 'grounding',
+        name: 'Búsqueda de Google (Search Grounding)',
+        passed: false,
+        code: codeG,
+        quotaExhausted: isQuota,
+        autoDisableRecommended: isQuota,
+        message: isQuota
+          ? 'Límite de cuota alcanzado para Google Search Grounding (Código 429).'
+          : `Fallo en prueba de búsqueda: ${err.message}`,
+        suggestedFix: isQuota
+          ? 'Desactiva la Búsqueda Web Automática en Ajustes para continuar conversando con Gemini sin agotar la cuota diaria.'
+          : 'Verifica tu plan en Google AI Studio o prueba sin búsqueda web.',
+      };
+    }
+  }
+
+  // Test F: Servidor Local & Red Interna
+  report.tests.localServer = {
+    id: 'local_server',
+    name: 'Servidor Local & Red Interna (127.0.0.1)',
+    passed: true,
+    userDataDir,
+    proxy: process.env.HTTPS_PROXY || 'Conexión Directa (Sin Proxy)',
+    message: `Servidor Express interno activo en 127.0.0.1. Directorio de datos: ${userDataDir}. Proxy: ${process.env.HTTPS_PROXY || 'Ninguno'}.`,
+  };
+
+  report.totalLatencyMs = Date.now() - startTime;
+  res.json(report);
+});
+
+// 4. Diagnóstico de la Cadena de Respaldo (Ruta Rápida)
+app.get('/api/assistant/diagnostics/chain', async (req, res) => {
+  const result = {
+    apiKeyConfigured: !!aiClient,
+    tiers: {
+      searchGrounding: false,
+      directGemini: false,
+      liteGemini: false,
+      localEngine: true,
+    },
+    latencyMs: 0,
+    timestamp: Date.now(),
+  };
+
+  if (!aiClient) return res.json(result);
+
+  const start = Date.now();
+  try {
+    const testDirect = await withTimeout(
+      aiClient.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: 'ping',
+        config: { maxOutputTokens: 5 },
+      }),
+      6000
+    );
+    result.tiers.directGemini = !!testDirect.text;
+  } catch {}
+
+  try {
+    const testSearch = await withTimeout(
+      aiClient.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: 'hora en Tokio hoy',
+        config: { maxOutputTokens: 10, tools: [{ googleSearch: {} }] },
+      }),
+      8000
+    );
+    result.tiers.searchGrounding = !!testSearch.text;
+  } catch {}
+
+  try {
+    const testLite = await withTimeout(
+      aiClient.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: 'ping',
+        config: { maxOutputTokens: 5 },
+      }),
+      6000
+    );
+    result.tiers.liteGemini = !!testLite.text;
+  } catch {}
+
+  result.latencyMs = Date.now() - start;
+  res.json(result);
+});
+
+// 5. Lista de Modelos Disponibles para la Clave Actual
+app.get('/api/assistant/diagnostics/models', async (req, res) => {
+  const models = await fetchAvailableModels(currentApiKey);
+  res.json({ models, activeKey: !!currentApiKey });
+});
+
+// 6. Obtención de Registros de Conexión (connection.log)
+app.get('/api/assistant/diagnostics/logs', (req, res) => {
+  if (fs.existsSync(connectionLogFile)) {
+    try {
+      const content = fs.readFileSync(connectionLogFile, 'utf-8');
+      const lines = content.split('\n').filter(Boolean);
+      return res.json({ logs: lines.slice(-60) });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
+  res.json({ logs: [] });
+});
+
+// 7. Gestión de Clave de API Segura en UserData (Recarga en Caliente)
 app.get('/api/assistant/config/apikey', (req, res) => {
   const isSet = !!currentApiKey && currentApiKey !== 'MY_GEMINI_API_KEY';
-  const masked = isSet && currentApiKey.length > 8
-    ? currentApiKey.substring(0, 6) + '...' + currentApiKey.substring(currentApiKey.length - 4)
+  const masked = isSet
+    ? '••••••••••••••••' + currentApiKey.slice(-4)
     : '';
-  res.json({ isConfigured: isSet, maskedKey: masked });
+  res.json({
+    isConfigured: isSet,
+    maskedKey: masked,
+    storageLocation: fs.existsSync(credentialsFile) ? credentialsFile : 'Entorno',
+  });
 });
 
 app.post('/api/assistant/config/apikey', (req, res) => {
@@ -89,17 +1328,77 @@ app.post('/api/assistant/config/apikey', (req, res) => {
   if (typeof apiKey === 'string') {
     const cleanKey = apiKey.trim();
     try {
-      fs.writeFileSync(credentialsFile, JSON.stringify({ apiKey: cleanKey, updatedAt: Date.now() }), 'utf-8');
+      let existingCreds: any = {};
+      if (fs.existsSync(credentialsFile)) {
+        try { existingCreds = JSON.parse(fs.readFileSync(credentialsFile, 'utf-8')); } catch {}
+      }
+      existingCreds.apiKey = cleanKey;
+      existingCreds.updatedAt = Date.now();
+      fs.writeFileSync(credentialsFile, JSON.stringify(existingCreds, null, 2), 'utf-8');
+
+      // Actualizar cliente Gemini en memoria de forma inmediata (sin reiniciar la app)
       refreshAiClient(cleanKey);
-      return res.json({ success: true, isConfigured: !!cleanKey });
+
+      logConnectionEvent(
+        'Config',
+        'KEY_SAVED',
+        0,
+        cleanKey ? `Clave guardada y recargada en caliente en UserData (...${cleanKey.slice(-4)})` : 'Clave eliminada. Modo local activo.'
+      );
+
+      return res.json({
+        success: true,
+        isConfigured: !!cleanKey,
+        maskedKey: cleanKey ? '••••••••••••••••' + cleanKey.slice(-4) : '',
+      });
     } catch (err: any) {
+      logConnectionEvent('Config', 'KEY_ERROR', 0, `Error guardando clave: ${err.message}`);
       return res.status(500).json({ error: 'Error guardando clave: ' + err.message });
     }
   }
   res.status(400).json({ error: 'apiKey inválida' });
 });
 
-// 3. User Data Store
+// 8. Gestión de Proxy Manual
+app.get('/api/assistant/config/proxy', (req, res) => {
+  res.json({
+    proxyUrl: process.env.HTTPS_PROXY || '',
+    systemProxyActive: !!process.env.HTTPS_PROXY,
+  });
+});
+
+app.post('/api/assistant/config/proxy', (req, res) => {
+  const { proxyUrl } = req.body;
+  const cleanProxy = typeof proxyUrl === 'string' ? proxyUrl.trim() : '';
+
+  try {
+    let existingCreds: any = {};
+    if (fs.existsSync(credentialsFile)) {
+      try { existingCreds = JSON.parse(fs.readFileSync(credentialsFile, 'utf-8')); } catch {}
+    }
+    existingCreds.proxy = cleanProxy;
+    existingCreds.updatedAt = Date.now();
+    fs.writeFileSync(credentialsFile, JSON.stringify(existingCreds, null, 2), 'utf-8');
+
+    if (cleanProxy) {
+      process.env.HTTPS_PROXY = cleanProxy;
+      process.env.HTTP_PROXY = cleanProxy;
+      try { setGlobalDispatcher(new EnvHttpProxyAgent()); } catch {}
+      logConnectionEvent('Proxy', 'CONFIGURED', 0, `Proxy manual configurado: ${cleanProxy}`);
+    } else {
+      delete process.env.HTTPS_PROXY;
+      delete process.env.HTTP_PROXY;
+      try { setGlobalDispatcher(new EnvHttpProxyAgent()); } catch {}
+      logConnectionEvent('Proxy', 'RESET', 0, 'Proxy manual restablecido a modo directo.');
+    }
+
+    return res.json({ success: true, proxyUrl: cleanProxy });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. User Data Store
 app.get('/api/assistant/userdata', (req, res) => {
   if (fs.existsSync(userStoreFile)) {
     try {
@@ -119,10 +1418,9 @@ app.post('/api/assistant/userdata', (req, res) => {
   }
 });
 
-// 4. Audio Transcription
+// 5. Audio Transcription
 app.post('/api/assistant/transcribe', async (req, res) => {
   const { audioBase64, mimeType = 'audio/webm' } = req.body;
-
   if (!audioBase64 || typeof audioBase64 !== 'string') {
     return res.status(400).json({ error: 'audioBase64 requerido' });
   }
@@ -133,19 +1431,11 @@ app.post('/api/assistant/transcribe', async (req, res) => {
         model: 'gemini-3.8-flash',
         contents: {
           parts: [
-            {
-              inlineData: {
-                mimeType,
-                data: audioBase64,
-              },
-            },
-            {
-              text: 'Transcribe exactamente en español lo que dice el usuario en este audio. Devuelve ÚNICAMENTE el texto transcrito directo, sin comillas ni aclaraciones.',
-            },
+            { inlineData: { mimeType, data: audioBase64 } },
+            { text: 'Transcribe exactamente en español lo que dice el usuario en este audio. Devuelve ÚNICAMENTE el texto transcrito directo, sin comillas ni aclaraciones.' },
           ],
         },
       });
-
       const transcript = (response.text || '').trim();
       return res.json({ transcript, source: 'gemini_audio' });
     } catch (err: any) {
@@ -160,11 +1450,10 @@ app.post('/api/assistant/transcribe', async (req, res) => {
   });
 });
 
-// 5. Microsoft Edge App Mode Launcher
+// 6. Microsoft Edge Launcher
 app.post('/api/assistant/launch-edge', (req, res) => {
   const port = req.body.port || process.env.PORT || 3000;
   const targetUrl = `http://localhost:${port}`;
-
   try {
     if (process.platform === 'win32') {
       spawn('msedge', [`--app=${targetUrl}`], { detached: true, stdio: 'ignore' }).unref();
@@ -179,315 +1468,47 @@ app.post('/api/assistant/launch-edge', (req, res) => {
   }
 });
 
-// Helper for Exponential Backoff on 429 / 503
-async function callWithBackoff(fn: () => Promise<any>, maxRetries = 2) {
-  let delay = 1000;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      const isRateOrBusy = 
-        err?.status === 429 || 
-        err?.statusCode === 429 || 
-        err?.status === 503 ||
-        (err?.message && (err.message.includes('429') || err.message.includes('RESOURCE_EXHAUSTED') || err.message.includes('503')));
-      
-      if (isRateOrBusy && attempt < maxRetries) {
-        console.warn(`[Viernes System] Reintentando tras limitación temporal (intento ${attempt + 1})...`);
-        await new Promise((r) => setTimeout(r, delay));
-        delay *= 2;
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-
-// Multi-Tier Fallback Chain for Gemini with Google Search Grounding
-async function generateGeminiWithSearchFallback(contents: any[], systemInstruction: string) {
-  if (!aiClient) return null;
-
-  // Tier 1: Gemini 3.8 Flash with Google Search Grounding
-  try {
-    const response = await callWithBackoff(() =>
-      aiClient!.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents,
-        config: {
-          systemInstruction,
-          temperature: 0.7,
-          tools: [{ googleSearch: {} }],
-        },
-      })
-    );
-
-    const rawText = response.text || '';
-    const sources: Array<{ title: string; url: string }> = [];
-    const metadata = response.candidates?.[0]?.groundingMetadata;
-
-    if (metadata?.groundingChunks) {
-      for (const chunk of metadata.groundingChunks) {
-        if (chunk.web?.uri) {
-          const uri = chunk.web.uri;
-          let hostname = uri;
-          try { hostname = new URL(uri).hostname.replace(/^www\./, ''); } catch {}
-          sources.push({
-            title: chunk.web.title || hostname,
-            url: uri,
-          });
-        }
-      }
-    }
-
-    // Deduplicate sources by URL
-    const uniqueSources = sources.filter((v, i, a) => a.findIndex(t => t.url === v.url) === i);
-
-    return {
-      text: rawText,
-      sources: uniqueSources,
-      source: 'gemini_search',
-    };
-  } catch (err1: any) {
-    console.warn('[Viernes System] Tier 1 (Gemini Search Grounding) falló:', err1.message);
-  }
-
-  // Tier 2: Gemini 3.8 Flash Standard (without Search tool)
-  try {
-    const response = await callWithBackoff(() =>
-      aiClient!.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents,
-        config: {
-          systemInstruction,
-          temperature: 0.7,
-        },
-      })
-    );
-
-    return {
-      text: response.text || '',
-      sources: [],
-      source: 'gemini',
-    };
-  } catch (err2: any) {
-    console.warn('[Viernes System] Tier 2 (Gemini Standard) falló:', err2.message);
-  }
-
-  // Tier 3: Lighter Gemini model (gemini-3.1-flash-lite)
-  try {
-    const response = await callWithBackoff(() =>
-      aiClient!.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents,
-        config: {
-          systemInstruction,
-          temperature: 0.7,
-        },
-      })
-    );
-
-    return {
-      text: response.text || '',
-      sources: [],
-      source: 'gemini_lite',
-    };
-  } catch (err3: any) {
-    console.warn('[Viernes System] Tier 3 (Gemini Flash Lite) falló:', err3.message);
-  }
-
-  return null;
-}
-
-// 6. Assistant Chat Endpoint with Search Grounding & Memory
+// 7. Endpoint Principal de Chat (No Streaming)
 app.post('/api/assistant/chat', async (req, res) => {
-  const { 
-    message, 
-    history = [], 
-    memories = [], 
-    systemContext = {}, 
-    personality = 'stark',
-    notifications = [] 
-  } = req.body;
-
-  if (!message || typeof message !== 'string') {
-    return res.status(400).json({ error: 'Mensaje requerido' });
-  }
-
-  // Extract notifications from request body or systemContext
-  const notifsList: any[] = Array.isArray(notifications) && notifications.length > 0
-    ? notifications
-    : Array.isArray(systemContext?.notifications) && systemContext.notifications.length > 0
-    ? systemContext.notifications
-    : [];
-
-  const notifsSummary = notifsList.length > 0
-    ? notifsList.slice(0, 15).map((n: any, idx: number) => {
-        const timeStr = n.timestamp ? new Date(n.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-        return `- [${n.app || 'Sistema'}] (${timeStr}) ${n.title ? n.title + ': ' : ''}${n.text || ''}`;
-      }).join('\n')
-    : 'No hay notificaciones recientes en la bandeja del sistema de Windows.';
-
-  // Inject user memories as context
-  const memorySummaries = Array.isArray(memories) && memories.length > 0
-    ? memories.slice(0, 30).map((m: any) => `- [${m.type || 'DATO'}] ${m.title || ''}: ${m.content || ''}`).join('\n')
-    : 'No hay memorias previas registradas.';
-
-  const systemInstruction = `Eres "Viernes" (F.R.I.D.A.Y.), la inteligencia artificial y asistente táctica personal inspirada en el sistema de Tony Stark / Industrias Stark.
-Tu comunicación es en español, con un tono elegante, táctico, profesional, leal y con personalidad ágil y servicial. Trata al usuario con confianza y cortesía ("jefe", "señor/a" o por su nombre si está en memoria).
-Respuestas directas, concisas y naturales para síntesis de voz (evita bloques gigantescos de texto o formato Markdown excesivo en la voz principal).
-
-REGLA DE CONFIANZA:
-Nunca respondas "no sé" a secas. Si un dato no es 100% verificable o no tienes certeza absoluta, proporciona la mejor estimación o análisis razonado disponible, indicando tu nivel de confianza y cómo verificarlo.
-Utiliza búsqueda web de Google siempre que te pregunten sobre noticias recientes, clima, cotizaciones, eventos actuales, horarios o datos en tiempo real.
-
-BANCO DE MEMORIA DEL USUARIO:
-${memorySummaries}
-
-NOTIFICACIONES ACTIVAS DE WINDOWS (WhatsApp, Outlook, Correo, Discord, etc.):
-${notifsSummary}
-- Si el usuario pregunta "¿tengo algo de WhatsApp?", "¿tengo mensajes?" o por alguna app específica, consulta esta lista exacta y responde con precisión.
-- Si pide "léeme las notificaciones" o "resume mis notificaciones", brinda un resumen ordenado y ejecutivo.
-
-ESTADO ACTUAL:
-Fecha y hora local: ${systemContext.currentTime || new Date().toLocaleString()}
-Batería: ${systemContext.battery || '98%'}
-Régimen: En línea y reactivo.
-
-DIRECTRICES DE ACCIÓN:
-Si el usuario pide una acción de automatización, responde confirmándola naturalmente y además adjunta al final de tu respuesta (en una línea separada con el prefijo "[[ACTION:") un comando JSON estructurado:
-- Abrir aplicación web: [[ACTION:{"type":"OPEN_APP","app":"youtube"|"spotify"|"whatsapp"|"maps"|"calendar"|"gmail"|"notes"|"calculator","query":"..."}]]
-- Guardar memoria: [[ACTION:{"type":"SAVE_MEMORY","category":"PREFERENCE"|"CONTACT_ALIAS"|"ROUTINE"|"FACT","title":"...","content":"..."}]]
-- Iniciar temporizador/cronómetro: [[ACTION:{"type":"TIMER","seconds":60,"label":"..."}]]
-- Activar rutina: [[ACTION:{"type":"ROUTINE","name":"..."}]]
-- Si es sólo conversación o respuesta informativa, no incluyas ningún bloque [[ACTION:...]].`;
-
-  // Build conversation history
-  const contents: any[] = [];
-  if (Array.isArray(history)) {
-    for (const item of history.slice(-10)) {
-      contents.push({
-        role: item.role === 'model' ? 'model' : 'user',
-        parts: [{ text: item.text || item.content || '' }],
-      });
-    }
-  }
-
-  contents.push({
-    role: 'user',
-    parts: [{ text: message }],
-  });
-
-  // Execute Fallback Chain
-  const geminiResult = await generateGeminiWithSearchFallback(contents, systemInstruction);
-
-  if (geminiResult && geminiResult.text) {
-    let cleanedText = geminiResult.text;
-    let detectedAction = null;
-    const actionMatch = geminiResult.text.match(/\[\[ACTION:(.*?)\]\]/s);
-
-    if (actionMatch) {
-      try {
-        detectedAction = JSON.parse(actionMatch[1].trim());
-        cleanedText = geminiResult.text.replace(actionMatch[0], '').trim();
-      } catch {}
-    }
-
-    return res.json({
-      response: cleanedText,
-      sources: geminiResult.sources || [],
-      action: detectedAction,
-      source: geminiResult.source,
+  try {
+    const result = await answerEverything(req.body);
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[Viernes System] Error inesperado en chat endpoint:', err);
+    return res.status(500).json({
+      response: 'Error interno de procesamiento. Los subsistemas locales permanecen intactos.',
+      tier: 'emergency',
+      confidence: 'baja',
+      sources: [],
     });
   }
-
-  // Tier 4: Offline / Fallback Intelligent Rule Engine (Viernes Native Subsystem)
-  const lower = message.toLowerCase().trim();
-  let responseText = '';
-  let detectedAction: any = null;
-
-  if (lower.includes('hola') || lower.includes('oye viernes') || lower.includes('viernes')) {
-    responseText = 'Sistemas en línea, jefe. Protocolos tácticos activos. ¿En qué puedo asistirte en este momento?';
-  } else if (lower.includes('whatsapp') && (lower.includes('tengo') || lower.includes('hay') || lower.includes('mensaje') || lower.includes('algo'))) {
-    const waNotifs = notifsList.filter((n: any) => (n.app || '').toLowerCase().includes('whatsapp'));
-    if (waNotifs.length > 0) {
-      const summaryItems = waNotifs.map((n: any) => `${n.title ? n.title + ': ' : ''}${n.text}`).join(' | ');
-      responseText = `Tienes ${waNotifs.length} notificación(es) de WhatsApp en tu sistema: ${summaryItems}`;
-    } else {
-      responseText = 'No tienes notificaciones pendientes de WhatsApp en este momento, jefe.';
-    }
-  } else if (lower.includes('léeme las notificaciones') || lower.includes('leeme las notificaciones') || lower.includes('resume mis notificaciones') || lower.includes('notificaciones')) {
-    if (notifsList.length > 0) {
-      const summaryItems = notifsList.slice(0, 5).map((n: any, idx: number) => `${idx + 1}. [${n.app}] ${n.title ? n.title + ': ' : ''}${n.text}`).join('. ');
-      responseText = `Tienes ${notifsList.length} notificación(es) del sistema: ${summaryItems}`;
-    } else {
-      responseText = 'No hay notificaciones pendientes en la bandeja de Windows.';
-    }
-  } else if (lower.includes('quién eres') || lower.includes('quien eres') || lower.includes('qué eres')) {
-    responseText = 'Soy Viernes, tu asistente de interfaz e inteligencia táctica y personal. Estoy aquí para gestionar tus comunicaciones, memorias, rutinas y consultas con precisión milimétrica.';
-  } else if (lower.includes('abre youtube') || lower.includes('abrir youtube')) {
-    const query = lower.replace(/.*youtube\s*(y busca|para buscar)?/i, '').trim();
-    responseText = query ? `Abriendo YouTube y buscando "${query}".` : 'Iniciando interfaz de YouTube, jefe.';
-    detectedAction = { type: 'OPEN_APP', app: 'youtube', query };
-  } else if (lower.includes('abre spotify') || lower.includes('reproduce') || lower.includes('pon música')) {
-    const query = lower.replace(/.*(spotify|reproduce|pon música)\s*/i, '').trim();
-    responseText = query ? `Sintonizando "${query}" en Spotify.` : 'Cargando tu lista de reproducción en Spotify.';
-    detectedAction = { type: 'OPEN_APP', app: 'spotify', query };
-  } else if (lower.includes('abre whatsapp') || lower.includes('mensaje')) {
-    responseText = 'Abriendo WhatsApp para tus comunicaciones directas.';
-    detectedAction = { type: 'OPEN_APP', app: 'whatsapp' };
-  } else if (lower.includes('mapas') || lower.includes('dónde queda') || lower.includes('cómo llegar a') || lower.includes('abre maps')) {
-    const query = lower.replace(/.*(mapas|maps|cómo llegar a|donde queda|dónde queda)\s*/i, '').trim();
-    responseText = query ? `Calculando ruta y localización para "${query}".` : 'Desplegando navegación por satélite en Google Maps.';
-    detectedAction = { type: 'OPEN_APP', app: 'maps', query };
-  } else if (lower.includes('temporizador') || lower.includes('alarma') || lower.includes('cuenta regresiva')) {
-    const minutesMatch = lower.match(/(\d+)\s*(minuto|minutos|min)/);
-    const secondsMatch = lower.match(/(\d+)\s*(segundo|segundos|seg)/);
-    let totalSeconds = 60;
-    if (minutesMatch) totalSeconds = parseInt(minutesMatch[1], 10) * 60;
-    else if (secondsMatch) totalSeconds = parseInt(secondsMatch[1], 10);
-    
-    responseText = `Temporizador configurado para ${Math.floor(totalSeconds / 60) > 0 ? Math.floor(totalSeconds / 60) + ' minutos' : totalSeconds + ' segundos'}. Te avisaré al completarse.`;
-    detectedAction = { type: 'TIMER', seconds: totalSeconds, label: 'Alarma de Viernes' };
-  } else if (lower.includes('recuerda que') || lower.includes('guarda que') || lower.includes('anota que')) {
-    const content = message.replace(/.*(recuerda que|guarda que|anota que)\s*/i, '').trim();
-    responseText = `Registrado en el núcleo de memoria: "${content}". Lo tendré presente en futuras decisiones.`;
-    detectedAction = {
-      type: 'SAVE_MEMORY',
-      category: 'FACT',
-      title: 'Dato recordado',
-      content,
-    };
-  } else if (lower.includes('qué sabes sobre mí') || lower.includes('que sabes sobre mi') || lower.includes('mis memorias') || lower.includes('resumen')) {
-    responseText = Array.isArray(memories) && memories.length > 0
-      ? `Tengo registrados ${memories.length} datos en tu banco de memoria semántica, incluyendo tus preferencias y rutinas de automatización.`
-      : 'Actualmente tu banco de memoria está vacío. Puedes indicarme "Recuerda que..." para comenzar a construir tu perfil personalizado.';
-  } else if (lower.includes('rutina de hoy') || lower.includes('activa rutina') || lower.includes('modo trabajo') || lower.includes('buenos días')) {
-    responseText = 'Iniciando protocolo de rutina. Preparando herramientas de enfoque y comprobando el estado de todos los subsistemas.';
-    detectedAction = { type: 'ROUTINE', name: lower.includes('trabajo') ? 'Modo Trabajo' : 'Rutina Diaria' };
-  } else if (lower.includes('calcula') || lower.match(/\d+\s*[\+\-\*\/x]\s*\d+/)) {
-    try {
-      const cleanExpr = lower.replace(/calcula/i, '').replace(/x/g, '*').replace(/[^0-9\+\-\*\/\.\(\)]/g, '');
-      const calcResult = Function(`'use strict'; return (${cleanExpr})`)();
-      responseText = `El cálculo de ${cleanExpr} da exactamente ${calcResult}.`;
-      detectedAction = { type: 'OPEN_APP', app: 'calculator' };
-    } catch {
-      responseText = 'Abriendo la calculadora integrada para tu operación.';
-      detectedAction = { type: 'OPEN_APP', app: 'calculator' };
-    }
-  } else {
-    // Never say "no sé" bluntly: provide best estimate + confidence
-    responseText = `Sin conexión exterior en este momento; procesando con mi banco de memoria local. Respecto a "${message}": estimo con confianza moderada que puedes revisar tus registros en el panel de Memoria o verificar la conexión de red para consultar fuentes satelitales en vivo.`;
-  }
-
-  return res.json({
-    response: responseText,
-    sources: [],
-    action: detectedAction,
-    source: 'local_subsystem',
-  });
 });
 
-// 7. Setup Static Serving / Vite Mode
+// 8. Endpoint de Chat con Streaming SSE
+app.post('/api/assistant/chat-stream', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  try {
+    const result = await answerEverything({
+      ...req.body,
+      onChunk: (chunk: string) => {
+        res.write(`data: ${JSON.stringify({ type: 'chunk', text: chunk })}\n\n`);
+      },
+    });
+
+    res.write(`data: ${JSON.stringify({ type: 'done', result })}\n\n`);
+    res.end();
+  } catch (err: any) {
+    res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    res.end();
+  }
+});
+
+// ==========================================
+// CONFIGURACIÓN DE ARCHIVOS ESTÁTICOS / VITE
+// ==========================================
 export async function setupApp(serverInstance?: http.Server) {
   const isProduction =
     process.env.NODE_ENV === 'production' ||
@@ -530,7 +1551,9 @@ export async function setupApp(serverInstance?: http.Server) {
   }
 }
 
-// 8. Server Lifecycle & Dynamic Port
+// ==========================================
+// CICLO DE VIDA DEL SERVIDOR
+// ==========================================
 export async function startServer(initialPort = 3000): Promise<{ server: http.Server; port: number }> {
   await setupApp();
 
@@ -561,7 +1584,6 @@ export async function startServer(initialPort = 3000): Promise<{ server: http.Se
   });
 }
 
-// Auto-start when executed directly
 const isMain = process.argv[1] && (
   process.argv[1].endsWith('server.ts') ||
   process.argv[1].endsWith('server.cjs') ||

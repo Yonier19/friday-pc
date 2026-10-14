@@ -20,4 +20,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   getRecentNotifications: () => ipcRenderer.invoke('get-recent-notifications'),
   setNotificationReaderConfig: (config) => ipcRenderer.invoke('set-notification-reader-config', config),
+
+  // Network & Proxy APIs
+  getSystemProxy: (testUrl) => ipcRenderer.invoke('get-system-proxy', testUrl),
+  setNetworkProxy: (proxyUrl) => ipcRenderer.invoke('set-network-proxy', proxyUrl),
 });

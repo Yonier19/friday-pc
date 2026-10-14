@@ -25,14 +25,18 @@ import {
 } from './types/assistant';
 import { memoryStorage, DEFAULT_SETTINGS } from './services/memoryStorage';
 import { audioService } from './services/audioService';
+import { IntentRouter } from './services/intentRouter';
+import { AlertTriangle, Settings as SettingsIcon } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'assistant' | 'memory' | 'automation' | 'permissions' | 'settings' | 'notifications'>('assistant');
   const [listeningState, setListeningState] = useState<ListeningState>('IDLE');
   const [transcriptInterim, setTranscriptInterim] = useState('');
+  const [thinkingStatus, setThinkingStatus] = useState('Pensando...');
   const [isMuted, setIsMuted] = useState(false);
   const [isResidentActive, setIsResidentActive] = useState(false);
   const [internetStatus, setInternetStatus] = useState<'ONLINE' | 'OFFLINE' | 'RECONNECTING'>('ONLINE');
+  const [isKeyConfigured, setIsKeyConfigured] = useState(true);
 
   // Notifications State
   const [notifications, setNotifications] = useState<WindowsNotification[]>([]);
@@ -60,9 +64,11 @@ export default function App() {
     {
       id: 'init-msg',
       sender: 'viernes',
-      text: 'Sistemas en línea, jefe. Protocolos tácticos activos. Soy Viernes, tu interfaz de asistencia e inteligencia personal de Industrias Stark. Conexión satelital y búsqueda web disponibles. ¿En qué puedo asistirte hoy?',
+      text: 'Sistemas en línea, jefe. Protocolos tácticos activos. Soy Viernes, tu interfaz de asistencia e inteligencia personal de Industrias Stark. Conexión satelital y motor de respuesta universal listos. ¿En qué puedo asistirte hoy?',
       timestamp: Date.now(),
       intent: 'GREETING',
+      confidence: 'alta',
+      tier: 'local',
     },
   ]);
 
@@ -77,39 +83,73 @@ export default function App() {
     setRoutines(loadedRoutines);
     setSettings(loadedSettings);
     setTelemetry(loadedTelemetry);
+
+    // Verificar si la API key está configurada en UserData o servidor
+    fetch('/api/assistant/config/apikey')
+      .then((res) => res.json())
+      .then((data) => {
+        setIsKeyConfigured(!!data.isConfigured);
+      })
+      .catch(() => {});
   }, []);
 
-  // Monitor Internet Connection & Health Heartbeat
+  // Monitor Real Outgoing Internet Connection & Reconnection with Backoff (Requisito 3)
   useEffect(() => {
+    let isMounted = true;
+    let timer: any = null;
+    let currentDelay = 15000;
+
+    const probeInternet = async () => {
+      try {
+        const res = await fetch('/api/assistant/check-internet');
+        if (!isMounted) return;
+        if (res.ok) {
+          const data = await res.json();
+          if (data.online) {
+            setInternetStatus('ONLINE');
+            currentDelay = 15000;
+          } else {
+            setInternetStatus((prev) => (prev === 'ONLINE' ? 'RECONNECTING' : 'OFFLINE'));
+            // Backoff exponencial ante fallos: 4s -> 8s -> 15s máx
+            currentDelay = Math.min(currentDelay * 1.5, 20000);
+          }
+        } else {
+          setInternetStatus('OFFLINE');
+          currentDelay = 6000;
+        }
+      } catch {
+        if (isMounted) {
+          setInternetStatus('OFFLINE');
+          currentDelay = 6000;
+        }
+      } finally {
+        if (isMounted) {
+          timer = setTimeout(probeInternet, currentDelay);
+        }
+      }
+    };
+
     const handleOnline = () => {
       setInternetStatus('RECONNECTING');
-      checkServerHealth();
+      if (timer) clearTimeout(timer);
+      probeInternet();
     };
-    const handleOffline = () => setInternetStatus('OFFLINE');
+
+    const handleOffline = () => {
+      setInternetStatus('OFFLINE');
+    };
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
-    const checkServerHealth = async () => {
-      try {
-        const res = await fetch('/api/assistant/health');
-        if (res.ok) {
-          setInternetStatus('ONLINE');
-        } else {
-          setInternetStatus('OFFLINE');
-        }
-      } catch {
-        setInternetStatus('OFFLINE');
-      }
-    };
-
-    checkServerHealth();
-    const pingInterval = setInterval(checkServerHealth, 15000);
+    // Ejecución inicial inmediata
+    probeInternet();
 
     return () => {
+      isMounted = false;
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
-      clearInterval(pingInterval);
+      if (timer) clearTimeout(timer);
     };
   }, []);
 
@@ -144,7 +184,7 @@ export default function App() {
 
   // Initialize Speech Recognition
   useEffect(() => {
-    const res = audioService.initSpeechRecognition(
+    audioService.initSpeechRecognition(
       {
         onWakeWordDetected: () => {
           if (settings.soundEffects) audioService.playActivationSound();
@@ -280,8 +320,12 @@ export default function App() {
     } else if (action.type === 'TIMER') {
       const secs = action.seconds || 60;
       setActiveTimer({ seconds: secs, label: action.label || 'Temporizador Táctico' });
+    } else if (action.type === 'CALCULATOR') {
+      setIsCalculatorOpen(true);
+    } else if (action.type === 'NOTES') {
+      setIsNotesOpen(true);
     } else if (action.type === 'SAVE_MEMORY') {
-      const newMem = memoryStorage.saveMemory({
+      memoryStorage.saveMemory({
         title: action.title || 'Dato Registrado',
         content: action.content || '',
         type: action.category || 'FACT',
@@ -327,22 +371,35 @@ export default function App() {
     setActiveTab('assistant');
   };
 
-  // Send message to assistant
+  // Guardar en memoria desde chips de mensajes
+  const handleSaveToMemory = (content: string) => {
+    memoryStorage.saveMemory({
+      title: 'Nota de Conversación',
+      content,
+      type: 'FACT',
+      category: 'Aprendizaje',
+      confidence: 0.98,
+    });
+    setMemories(memoryStorage.getMemories());
+    if (settings.soundEffects) audioService.playActivationSound();
+  };
+
+  // Send message to assistant con streaming y orquestación universal
   const handleSendMessage = async (text: string) => {
     if (!text.trim()) return;
 
-    // Check if user asked to read or summarize notifications directly by voice
-    const lower = text.toLowerCase();
-    if (lower.includes('léeme las notificaciones') || lower.includes('leeme las notificaciones') || lower.includes('lee mis notificaciones')) {
-      if (notifications.length === 0) {
-        audioService.speak('No tienes notificaciones pendientes para leer, jefe.');
-      } else {
-        const textToRead = notifications
-          .slice(0, 4)
-          .map((n, i) => `Aviso de ${n.app}. ${n.title}. ${n.text}.`)
-          .join(' ');
-        audioService.speak(`Tienes ${notifications.length} notificaciones. ` + textToRead);
-      }
+    // 1. Clasificación previa de la intención
+    const intent = IntentRouter.classify(text.trim());
+    if (intent.requiresSearch || intent.category === 'CURRENT_INFO') {
+      setThinkingStatus('Buscando en la web con Google...');
+    } else if (intent.category === 'LOCAL_COMMAND') {
+      setThinkingStatus('Ejecutando comando táctico...');
+    } else if (intent.category === 'CALCULATION') {
+      setThinkingStatus('Calculando valor exacto...');
+    } else if (intent.category === 'URL_QUERY') {
+      setThinkingStatus('Inspeccionando enlace web...');
+    } else {
+      setThinkingStatus('Pensando respuesta táctica...');
     }
 
     const userMsg: ChatMessage = {
@@ -352,57 +409,111 @@ export default function App() {
       timestamp: Date.now(),
     };
 
-    setMessages((prev) => [...prev, userMsg]);
+    const assistantMsgId = `ast-${Date.now()}`;
+    const initialAssistantMsg: ChatMessage = {
+      id: assistantMsgId,
+      sender: 'viernes',
+      text: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+    };
+
+    setMessages((prev) => [...prev, userMsg, initialAssistantMsg]);
     setListeningState('THINKING');
     if (settings.soundEffects) audioService.playProcessingSound();
 
     try {
-      const response = await fetch('/api/assistant/chat', {
+      // Intentar streaming SSE primero
+      const response = await fetch('/api/assistant/chat-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text.trim(),
-          history: messages.slice(-8),
+          history: messages.slice(-10),
           memories,
-          personality: settings.personality,
+          settings,
           notifications: notifications.slice(0, 20),
           systemContext: {
             currentTime: new Date().toLocaleString(),
+            city: settings.userCity || 'Madrid',
             battery: `${telemetry.battery}%`,
             notificationsCount: notifications.length,
-            notifications: notifications.slice(0, 20),
           },
         }),
       });
 
-      const data = await response.json();
-      const replyText = data.response || 'Comando procesado, jefe.';
+      if (!response.ok || !response.body) {
+        throw new Error('Fallo al abrir canal de streaming');
+      }
 
-      const assistantMsg: ChatMessage = {
-        id: `ast-${Date.now()}`,
-        sender: 'viernes',
-        text: replyText,
-        timestamp: Date.now(),
-        action: data.action,
-        sources: data.sources,
-        source: data.source,
-      };
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulatedText = '';
+      let finalResultData: any = null;
 
-      setMessages((prev) => [...prev, assistantMsg]);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
 
-      if (data.action) {
-        handleExecuteAction(data.action);
+        const rawChunk = decoder.decode(value, { stream: true });
+        const lines = rawChunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const parsed = JSON.parse(line.slice(6));
+              if (parsed.type === 'chunk' && parsed.text) {
+                accumulatedText += parsed.text;
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === assistantMsgId
+                      ? { ...m, text: accumulatedText, isStreaming: true }
+                      : m
+                  )
+                );
+              } else if (parsed.type === 'done' && parsed.result) {
+                finalResultData = parsed.result;
+              }
+            } catch {}
+          }
+        }
+      }
+
+      const replyText = finalResultData?.response || accumulatedText || 'Protocolo completado con éxito, jefe.';
+
+      // Actualizar mensaje con todos los metadatos finales
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                text: replyText,
+                isStreaming: false,
+                action: finalResultData?.action,
+                sources: finalResultData?.sources,
+                source: finalResultData?.source,
+                tier: finalResultData?.tier,
+                confidence: finalResultData?.confidence,
+                disclaimer: finalResultData?.disclaimer,
+                clarificationQuestion: finalResultData?.clarificationQuestion,
+                isCorrection: finalResultData?.isCorrection,
+              }
+            : m
+        )
+      );
+
+      if (finalResultData?.action) {
+        handleExecuteAction(finalResultData.action);
       }
 
       // Voice read-aloud
       if (settings.autoSpeak && !isMuted) {
         setListeningState('SPEAKING');
 
-        // Formulate spoken text (if sources are present, brief vocal mention)
         let spokenText = replyText;
-        if (data.sources && data.sources.length > 0) {
-          const firstTwo = data.sources.slice(0, 2).map((s: any) => s.title).join(' y ');
-          spokenText += ` Datos fundamentados en fuentes como ${firstTwo}.`;
+        if (finalResultData?.sources && finalResultData.sources.length > 0) {
+          const firstTwo = finalResultData.sources.slice(0, 2).map((s: any) => s.title).join(' y ');
+          spokenText += ` Datos fundamentados según fuentes como ${firstTwo}.`;
         }
 
         audioService.speak(spokenText, {
@@ -420,19 +531,57 @@ export default function App() {
       } else {
         setListeningState(isResidentActive ? 'LISTENING' : 'IDLE');
       }
-    } catch (err) {
-      console.error('Error in chat request:', err);
-      const fallbackReply = 'Sistemas tácticos en línea. Error momentáneo de enlace exterior, operando con protocolos locales.';
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `ast-${Date.now()}`,
-          sender: 'viernes',
-          text: fallbackReply,
-          timestamp: Date.now(),
-        },
-      ]);
-      setListeningState('IDLE');
+    } catch {
+      // Fallback a endpoint estándar no-streaming ante desconexión o fallo de stream
+      try {
+        const fallbackRes = await fetch('/api/assistant/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: text.trim(),
+            history: messages.slice(-10),
+            memories,
+            settings,
+            notifications: notifications.slice(0, 20),
+            systemContext: {
+              currentTime: new Date().toLocaleString(),
+              city: settings.userCity || 'Madrid',
+              battery: `${telemetry.battery}%`,
+            },
+          }),
+        });
+        const fallbackData = await fallbackRes.json();
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  text: fallbackData.response || 'Respuesta generada en modo de contingencia.',
+                  isStreaming: false,
+                  tier: fallbackData.tier || 'local',
+                  confidence: fallbackData.confidence || 'media',
+                  sources: fallbackData.sources || [],
+                  disclaimer: fallbackData.disclaimer,
+                }
+              : m
+          )
+        );
+      } catch {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  text: 'Sistemas en línea bajo base local. No se logró conectar con el servidor central; ejecutando protocolos locales.',
+                  isStreaming: false,
+                  tier: 'emergency',
+                  confidence: 'baja',
+                }
+              : m
+          )
+        );
+      }
+      setListeningState(isResidentActive ? 'LISTENING' : 'IDLE');
     }
   };
 
@@ -472,6 +621,31 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 overflow-hidden flex flex-col relative">
+        {/* Aviso Visible: Falta la API Key (Requisito 2) */}
+        {!isKeyConfigured && activeTab !== 'settings' && (
+          <div className="mx-4 mt-2.5 mb-1.5 p-3 rounded-xl bg-amber-950/80 border border-amber-500/60 flex items-center justify-between shadow-lg shadow-black/50 z-30 shrink-0 animate-fade-in backdrop-blur-sm">
+            <div className="flex items-center space-x-3">
+              <div className="p-2 rounded-lg bg-amber-900/70 text-amber-400 shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <span className="text-xs font-orbitron font-bold text-amber-200 block">
+                  FALTA LA API KEY: ESTÁS OPERANDO EN MODO LOCAL
+                </span>
+                <span className="text-[11px] text-amber-300/80 font-rajdhani">
+                  Viernes mantiene operativas todas las funciones locales (cálculos, notas, temporizadores, rutinas y memorias). Para activar Google Search Grounding y respuestas tácticas avanzadas en la nube, añade tu clave gratuita de Gemini.
+                </span>
+              </div>
+            </div>
+            <button
+              onClick={() => setActiveTab('settings')}
+              className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold shrink-0 cursor-pointer transition-all flex items-center space-x-1.5 shadow-md shadow-amber-950 ml-3"
+            >
+              <SettingsIcon className="w-3.5 h-3.5" />
+              <span>Configurar en Ajustes</span>
+            </button>
+          </div>
+        )}
         {activeTab === 'assistant' && (
           <MainScreen
             messages={messages}
@@ -482,6 +656,9 @@ export default function App() {
             settings={settings}
             onExecuteAction={handleExecuteAction}
             transcriptInterim={transcriptInterim}
+            thinkingStatus={thinkingStatus}
+            onFollowUpClick={(prompt) => handleSendMessage(prompt)}
+            onSaveToMemory={handleSaveToMemory}
           />
         )}
 
@@ -548,10 +725,21 @@ export default function App() {
               if (electronAPI && typeof electronAPI.setNotificationReaderConfig === 'function') {
                 electronAPI.setNotificationReaderConfig({
                   enabled: newSettings.windowsNotificationsEnabled !== false,
-                  allowedApps: newSettings.notificationAllowedApps,
-                  blockedApps: newSettings.notificationBlockedApps,
+                  allowedApps: newSettings.notificationAutoReadApps || ['whatsapp'],
+                  blockedApps: newSettings.notificationBlockedApps || [],
                 });
               }
+
+              // Update Electron network proxy if specified
+              if (electronAPI && typeof electronAPI.setNetworkProxy === 'function' && newSettings.proxyUrl !== undefined) {
+                electronAPI.setNetworkProxy(newSettings.proxyUrl);
+              }
+
+              // Re-check API key status to update warning banner immediately
+              fetch('/api/assistant/config/apikey')
+                .then((res) => res.json())
+                .then((data) => setIsKeyConfigured(!!data.isConfigured))
+                .catch(() => {});
             }}
             onResetFactory={handleResetFactory}
           />
@@ -574,6 +762,13 @@ export default function App() {
           <NotesWidget
             onClose={() => setIsNotesOpen(false)}
             onNoteSavedToMemory={(title, text) => {
+              memoryStorage.saveMemory({
+                title: title || 'Nota Rápida',
+                content: text,
+                type: 'FACT',
+                category: 'Notas',
+                confidence: 0.95,
+              });
               setMemories(memoryStorage.getMemories());
               if (settings.soundEffects) audioService.playActivationSound();
             }}
